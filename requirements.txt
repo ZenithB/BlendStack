@@ -1,0 +1,9 @@
+# BlendStack runtime dependencies (Python 3.11+)
+numpy
+pillow
+rawpy
+imageio
+PySide6
+
+# Development / testing
+pytest

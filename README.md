@@ -25,11 +25,19 @@ On top of the faithful core, BlendStack adds what the camera doesn't offer:
 blendstack/
 ├── core/          # Pure engine — NumPy pipeline, blend mode registry, IO, geometry
 ├── app/           # PySide6 standalone macOS app
-gimp_plugin/       # GIMP 3.2 plugin (GObject Introspection)
+gimp_plugin/       # GIMP 3.2 plugin (GObject Introspection) + install README
+packaging/         # PyInstaller spec + build script for the distributable .app
 scripts/           # CLI test harness (blend a folder of images)
-tests/             # Engine acceptance tests
+tests/             # Engine acceptance tests (68 tests)
 docs/              # Project brief / specification
 ```
+
+## Pre-built macOS app
+
+Run `packaging/build_app.sh` to produce a self-contained, ad-hoc-signed
+`dist/BlendStack.app` (~118 MB, Apple Silicon) plus a distributable
+`BlendStack-1.0.0-arm64.zip`. The app is not notarised — first launch on
+another Mac needs right-click → Open (documented in the bundled README).
 
 ## Quick start (engine + CLI)
 
@@ -38,7 +46,7 @@ Requires Python 3.11+.
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install numpy pillow rawpy PySide6
+pip install -r requirements.txt
 
 # Blend a folder of images
 python scripts/blend_folder.py /path/to/images --mode canon_bright --out blend.tif
@@ -54,7 +62,12 @@ Drag images in (TIFF, JPEG, PNG, GIF, BMP, WebP, RAW), reorder the strip (top = 
 
 ## GIMP plugin
 
-Copy `gimp_plugin/blendstack` into your GIMP 3.2 plug-ins directory, then find it under **Filters → Combine → BlendStack…**. It blends all visible layers (top layer = base) and inserts the result as a new top layer.
+Copy `gimp_plugin/blendstack-blend/` into your GIMP 3 plug-ins directory
+(`~/Library/Application Support/GIMP/3.0/plug-ins/` on macOS) and make the
+script executable, then find it under **Filters → Combine → BlendStack…**.
+It blends all visible layers (top layer = base) and inserts the result as a
+new top layer. Full install notes, including the one-time NumPy install for
+GIMP's bundled Python, are in [gimp_plugin/README.md](gimp_plugin/README.md).
 
 ## Tests
 
