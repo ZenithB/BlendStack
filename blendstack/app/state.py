@@ -206,8 +206,12 @@ class DocumentState(QObject):
 
     def set_mode(self, mode: str) -> None:
         if mode != self._mode:
-            engine.get_mode(mode)  # validate early
+            spec = engine.get_mode(mode)  # validate early
             self._mode = mode
+            # Reset params to the new mode's defaults so stale softness/bias/
+            # basis (or any other mode's params) never leak across a switch.
+            # New modes declare no params → this becomes {}.
+            self._params = spec.default_params()
             self.blend_changed.emit()
 
     def set_param(self, name: str, value: Any) -> None:

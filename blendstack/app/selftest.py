@@ -11,6 +11,11 @@ Exercises, against a real (offscreen) MainWindow:
 3. softness + one image's exposure changes trigger a re-render
    (generation counter advances);
 4. drag-style reorder changes strip and document order;
+4b. dynamic blend controls: switching to a param-less mode (multiply,
+   average) hides softness/bias/basis and still renders; switching back to
+   canon_bright shows them again; per-mode params reset on switch;
+4c. preset round-trip for a param-less mode (multiply) restores the mode
+   and its empty params;
 5. preset save → clear → load round-trip restores images and settings;
 6. the 21st image is refused with a clear message;
 7. full-resolution export to 16-bit TIFF (dims + dtype verified).
@@ -135,6 +140,79 @@ def main() -> int:
           ids_after == [ids_before[1], ids_before[0], ids_before[2]],
           f"before={ids_before} after={ids_after}")
     wait_until(lambda: render_settled(window))
+
+    # -- 4b. dynamic per-mode blend controls ----------------------------------------
+    bc = window.blend_controls
+
+    def _select_mode(name: str) -> None:
+        idx = bc.mode_combo.findData(name)
+        bc.mode_combo.setCurrentIndex(idx)  # user-style edit → mode_changed
+
+    gen_before = window.preview.completed_generation
+    _select_mode("multiply")
+    ok = wait_until(
+        lambda: render_settled(window)
+        and window.preview.completed_generation > gen_before
+        and window.canvas.has_image()
+    )
+    check("multiply selected reaches state", window.state.mode == "multiply",
+          f"mode={window.state.mode}")
+    check("multiply hides softness/bias/basis rows",
+          not bc.softness_row.isVisible()
+          and not bc.bias_row.isVisible()
+          and not bc.basis_row.isVisible())
+    check("multiply params reset to empty", window.state.params == {},
+          f"params={window.state.params}")
+    check("preview still renders in multiply", ok and window.canvas.has_image())
+
+    gen_before = window.preview.completed_generation
+    _select_mode("average")
+    ok = wait_until(
+        lambda: render_settled(window)
+        and window.preview.completed_generation > gen_before
+        and window.canvas.has_image()
+    )
+    check("average selected reaches state", window.state.mode == "average",
+          f"mode={window.state.mode}")
+    check("preview renders in average (linear-light)",
+          ok and window.canvas.has_image())
+
+    gen_before = window.preview.completed_generation
+    _select_mode("canon_bright")
+    wait_until(
+        lambda: render_settled(window)
+        and window.preview.completed_generation > gen_before
+    )
+    check("canon_bright shows softness/bias/basis rows again",
+          bc.softness_row.isVisible()
+          and bc.bias_row.isVisible()
+          and bc.basis_row.isVisible())
+    check("canon_bright params reset to defaults",
+          set(window.state.params) == {"softness", "bias", "basis"},
+          f"params={window.state.params}")
+
+    # -- 4c. preset round-trip for a param-less mode (multiply) ---------------------
+    _select_mode("multiply")
+    wait_until(lambda: render_settled(window))
+    multiply_preset = tmp / "multiply.bsp"
+    window.save_preset_to(multiply_preset)
+    check("multiply preset written", multiply_preset.exists())
+    _select_mode("canon_bright")  # move away so reload must restore it
+    wait_until(lambda: render_settled(window))
+    window.load_preset_from(multiply_preset)
+    wait_until(lambda: render_settled(window))
+    check("multiply preset restored mode", window.state.mode == "multiply",
+          f"mode={window.state.mode}")
+    check("multiply preset restored empty params",
+          window.state.params == {}, f"params={window.state.params}")
+
+    # Restore a Canon mode + softness for the remaining round-trip checks.
+    _select_mode("canon_bright")
+    window.blend_controls.softness_row.slider.setValue(30)
+    wait_until(lambda: render_settled(window))
+    check("canon softness re-applied after preset detour",
+          window.state.params.get("softness") == 30.0,
+          f"params={window.state.params}")
 
     # -- 5. preset save / clear / load round-trip ---------------------------------
     preset_path = tmp / "roundtrip.bsp"
