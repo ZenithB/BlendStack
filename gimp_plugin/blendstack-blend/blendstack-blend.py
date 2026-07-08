@@ -44,7 +44,11 @@ import gi
 gi.require_version("Gimp", "3.0")   # 3.0 API is stable across the 3.x series
 gi.require_version("GimpUi", "3.0")
 gi.require_version("Gegl", "0.4")
-from gi.repository import Gegl, Gimp, GimpUi, GLib, GObject  # noqa: E402
+gi.require_version("Gtk", "3.0")    # GIMP 3.2 UI is GTK3
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import (  # noqa: E402
+    GdkPixbuf, Gegl, Gimp, GimpUi, GLib, GObject, Gtk,
+)
 
 # fold_purepy is the stdlib-only fallback backend and the source of the mode
 # metadata + layer limits. It has no dependencies, so it always imports and
@@ -91,6 +95,138 @@ def _error(procedure, message):
     return procedure.new_return_values(
         Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error(message)
     )
+
+
+def _layer_float_bytes(layer):
+    """(raw float32 bytes, w, h, has_alpha, off_x, off_y) for a layer."""
+    layer_w, layer_h = layer.get_width(), layer.get_height()
+    buffer = layer.get_buffer()
+    rect = Gegl.Rectangle.new(0, 0, layer_w, layer_h)
+    has_alpha = layer.has_alpha()
+    fmt = "R'G'B'A float" if has_alpha else "R'G'B' float"
+    data = buffer.get(rect, 1.0, fmt, Gegl.AbyssPolicy.NONE)
+    offsets = layer.get_offsets()
+    # GIMP 3 returns (success, offset_x, offset_y); tolerate bindings that
+    # drop the leading boolean.
+    off_x, off_y = int(offsets[-2]), int(offsets[-1])
+    return data, layer_w, layer_h, has_alpha, off_x, off_y
+
+
+# --------------------------------------------------------------------------
+# Live preview (added post-v1 on user request; brief §6 originally shipped
+# without one). The preview is a small, downscaled rendering shown inside
+# the dialog and updated as the blend controls change.
+# --------------------------------------------------------------------------
+
+PREVIEW_MAX_EDGE = 360      # longest edge of the preview, in pixels
+PREVIEW_DEBOUNCE_MS = 120   # coalesce rapid slider changes
+
+
+class _PreviewController:
+    """Owns the dialog's Preview checkbox + image and keeps them in sync.
+
+    Ticking the box builds a one-time downscaled cache of the visible layers
+    (via ``image.duplicate()`` + ``scale()`` so GIMP does the resampling),
+    then every blend-control change re-folds just that small cache in pure
+    Python (milliseconds) and repaints. The whole preview path is wrapped so
+    any failure disables the preview quietly and never affects the real
+    blend, which runs at full resolution when the dialog is accepted.
+    """
+
+    def __init__(self, image, config, check, container, image_widget):
+        self._image = image
+        self._config = config
+        self._check = check
+        self._container = container      # frame shown/hidden with the toggle
+        self._image_widget = image_widget
+        self._cache = None               # (list[array('f')], sw, sh) or None
+        self._pending = 0                # debounce timeout source id
+        self._handlers = []              # (obj, handler_id) to disconnect
+        self._handlers.append((check, check.connect("toggled", self._on_toggle)))
+        for prop in ("mode", "softness", "bias", "basis"):
+            hid = config.connect("notify::" + prop, self._on_param)
+            self._handlers.append((config, hid))
+
+    def disconnect(self):
+        """Drop all signal connections and any pending redraw (call when the
+        dialog closes so repeat runs don't accumulate stale handlers)."""
+        if self._pending:
+            GLib.source_remove(self._pending)
+            self._pending = 0
+        for obj, hid in self._handlers:
+            try:
+                obj.disconnect(hid)
+            except Exception:  # noqa: BLE001 - object may already be gone
+                pass
+        self._handlers = []
+
+    # -- signal handlers ---------------------------------------------------
+
+    def _on_toggle(self, _btn):
+        if self._check.get_active():
+            self._cache = None           # rebuilt on next recompute
+            self._container.show()
+            self._schedule()
+        else:
+            self._container.hide()
+
+    def _on_param(self, *_args):
+        if self._check.get_active():
+            self._schedule()
+
+    # -- work --------------------------------------------------------------
+
+    def _schedule(self):
+        if self._pending:
+            GLib.source_remove(self._pending)
+        self._pending = GLib.timeout_add(PREVIEW_DEBOUNCE_MS, self._recompute)
+
+    def _build_cache(self):
+        """Downscale the image once and read its visible layers to canvases."""
+        self._cache = None
+        dup = self._image.duplicate()
+        try:
+            cw, ch = dup.get_width(), dup.get_height()
+            sw, sh = fold_purepy.preview_target_size(cw, ch, PREVIEW_MAX_EDGE)
+            if (sw, sh) != (cw, ch):
+                dup.scale(sw, sh)
+                sw, sh = dup.get_width(), dup.get_height()
+            visible = [l for l in dup.get_layers() if l.get_visible()]
+            layers = []
+            for layer in visible[:MAX_LAYERS]:
+                data, w, h, has_alpha, ox, oy = _layer_float_bytes(layer)
+                layers.append(
+                    fold_purepy.layer_to_canvas(data, w, h, has_alpha, ox, oy, sw, sh)
+                )
+            self._cache = (layers, sw, sh)
+        finally:
+            dup.delete()  # off-screen duplicate; never shown, no undo impact
+
+    def _recompute(self):
+        self._pending = 0
+        if not self._check.get_active():
+            return False
+        try:
+            if self._cache is None:
+                self._build_cache()
+            layers, sw, sh = self._cache
+            if len(layers) < MIN_LAYERS:
+                self._image_widget.clear()
+                return False
+            mode = self._config.get_property("mode")
+            softness = self._config.get_property("softness")
+            bias = self._config.get_property("bias")
+            basis = self._config.get_property("basis")
+            result = fold_purepy.fold(layers, mode, softness, bias, basis)
+            data = GLib.Bytes.new(fold_purepy.canvas_to_rgb8(result))
+            pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+                data, GdkPixbuf.Colorspace.RGB, False, 8, sw, sh, sw * 3
+            )
+            self._image_widget.set_from_pixbuf(pixbuf)
+        except Exception as exc:  # never let preview break the dialog
+            print(f"BlendStack preview error: {exc}", file=sys.stderr)
+            self._cache = None
+        return False  # one-shot timeout
 
 
 class BlendStack(Gimp.PlugIn):
@@ -168,7 +304,18 @@ class BlendStack(Gimp.PlugIn):
             GimpUi.init("blendstack-blend")
             dialog = GimpUi.ProcedureDialog.new(procedure, config, "BlendStack")
             dialog.fill(None)  # auto-render all registered arguments
-            if not dialog.run():
+            # Attach the live preview (checkbox + downscaled image) below the
+            # auto-filled controls. Wrapped so a preview/GTK failure can never
+            # stop the blend controls from working.
+            preview_ctrl = None
+            try:
+                preview_ctrl = self._attach_preview(dialog, image, config)
+            except Exception as exc:  # noqa: BLE001
+                print(f"BlendStack: preview unavailable ({exc})", file=sys.stderr)
+            accepted = dialog.run()
+            if preview_ctrl is not None:
+                preview_ctrl.disconnect()
+            if not accepted:
                 dialog.destroy()
                 return procedure.new_return_values(
                     Gimp.PDBStatusType.CANCEL, GLib.Error()
@@ -184,6 +331,33 @@ class BlendStack(Gimp.PlugIn):
             return self._blend(procedure, image, mode, softness, bias, basis)
         except Exception as exc:  # keep GIMP responsive on unexpected errors
             return _error(procedure, f"BlendStack failed: {exc}")
+
+    @staticmethod
+    def _attach_preview(dialog, image, config):
+        """Pack a Preview checkbox + image into the dialog; return its
+        controller (kept alive for the dialog's lifetime)."""
+        content = dialog.get_content_area()
+
+        check = Gtk.CheckButton.new_with_label("Preview")
+        frame = Gtk.Frame()
+        preview_image = Gtk.Image()
+        preview_image.set_margin_top(4)
+        preview_image.set_margin_bottom(4)
+        preview_image.set_margin_start(4)
+        preview_image.set_margin_end(4)
+        frame.add(preview_image)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.pack_start(check, False, False, 0)
+        box.pack_start(frame, False, False, 0)
+        content.pack_start(box, False, False, 0)
+
+        box.show_all()
+        frame.hide()  # preview area appears only once ticked
+
+        return _PreviewController(image, config, check, frame, preview_image)
 
     def _blend(self, procedure, image, mode, softness, bias, basis):
         if image.get_base_type() != Gimp.ImageBaseType.RGB:
@@ -253,25 +427,10 @@ class BlendStack(Gimp.PlugIn):
             Gimp.PDBStatusType.SUCCESS, GLib.Error()
         )
 
-    @staticmethod
-    def _layer_float_bytes(layer):
-        """(raw float32 bytes, w, h, has_alpha, off_x, off_y) for a layer."""
-        layer_w, layer_h = layer.get_width(), layer.get_height()
-        buffer = layer.get_buffer()
-        rect = Gegl.Rectangle.new(0, 0, layer_w, layer_h)
-        has_alpha = layer.has_alpha()
-        fmt = "R'G'B'A float" if has_alpha else "R'G'B' float"
-        data = buffer.get(rect, 1.0, fmt, Gegl.AbyssPolicy.NONE)
-        offsets = layer.get_offsets()
-        # GIMP 3 returns (success, offset_x, offset_y); tolerate bindings
-        # that drop the leading boolean.
-        off_x, off_y = int(offsets[-2]), int(offsets[-1])
-        return data, layer_w, layer_h, has_alpha, off_x, off_y
-
     @classmethod
     def _read_layer_np(cls, layer, canvas_w, canvas_h):
         """NumPy path: layer -> float32 (canvas_h, canvas_w, 3) on black."""
-        data, w, h, has_alpha, off_x, off_y = cls._layer_float_bytes(layer)
+        data, w, h, has_alpha, off_x, off_y = _layer_float_bytes(layer)
         if has_alpha:
             rgba = np.frombuffer(data, dtype=np.float32).reshape(h, w, 4)
             rgb = blend_logic.flatten_alpha(rgba)
@@ -284,7 +443,7 @@ class BlendStack(Gimp.PlugIn):
     @classmethod
     def _read_layer_pp(cls, layer, canvas_w, canvas_h):
         """Pure-Python path: layer -> array('f') canvas on black background."""
-        data, w, h, has_alpha, off_x, off_y = cls._layer_float_bytes(layer)
+        data, w, h, has_alpha, off_x, off_y = _layer_float_bytes(layer)
         return fold_purepy.layer_to_canvas(
             data, w, h, has_alpha, off_x, off_y, canvas_w, canvas_h
         )

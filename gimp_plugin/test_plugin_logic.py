@@ -312,6 +312,38 @@ def test_purepy_metadata_matches():
     assert pp.mode_label("canon_bright") == "Canon Bright"
 
 
+# ---------------------------------------------------------------------------
+# 8. Preview helpers (in-dialog live preview)
+# ---------------------------------------------------------------------------
+
+def test_preview_target_size():
+    assert pp.preview_target_size(6000, 4000, 360) == (360, 240)   # landscape
+    assert pp.preview_target_size(4000, 6000, 360) == (240, 360)   # portrait
+    assert pp.preview_target_size(300, 200, 360) == (300, 200)     # already small
+    assert pp.preview_target_size(360, 360, 360) == (360, 360)     # exact
+    w, h = pp.preview_target_size(6000, 4000, 360)
+    assert abs((w / h) - (6000 / 4000)) < 0.02                     # aspect kept
+    assert max(w, h) <= 360
+
+
+def test_preview_canvas_to_rgb8():
+    c = array.array("f", [0.0, 1.0, 0.5, -0.2, 1.5, 0.999])
+    assert list(pp.canvas_to_rgb8(c)) == [0, 255, 128, 0, 255, 255]
+
+
+def test_preview_pipeline_shape():
+    # Downscaled fold + pack produces exactly w*h*3 bytes for the pixbuf.
+    rng = np.random.default_rng(21)
+    sw, sh = 120, 90
+    canvases = [
+        array.array("f", rng.random(sh * sw * 3).astype(np.float32).tobytes())
+        for _ in range(4)
+    ]
+    res = pp.fold(canvases, "canon_bright", 0, 0, "per_channel")
+    packed = pp.canvas_to_rgb8(res)
+    assert len(packed) == sw * sh * 3
+
+
 def main() -> int:
     tests = [
         (name, fn) for name, fn in sorted(globals().items())

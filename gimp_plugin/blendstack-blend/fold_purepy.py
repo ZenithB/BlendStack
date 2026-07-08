@@ -202,3 +202,32 @@ def _sigmoid(z: float) -> float:
 def to_bytes(canvas: array.array) -> bytes:
     """Serialise a canvas array back to a little-endian float32 buffer."""
     return canvas.tobytes()
+
+
+# --------------------------------------------------------------------------
+# Preview helpers (used by the plugin's in-dialog live preview)
+# --------------------------------------------------------------------------
+
+def preview_target_size(cw: int, ch: int, max_edge: int) -> Tuple[int, int]:
+    """Downscaled (w, h) whose longest edge is <= ``max_edge``, aspect kept.
+
+    Images already within ``max_edge`` are returned unchanged.
+    """
+    longest = max(cw, ch)
+    if longest <= max_edge:
+        return int(cw), int(ch)
+    s = float(max_edge) / float(longest)
+    return max(1, int(round(cw * s))), max(1, int(round(ch * s)))
+
+
+def canvas_to_rgb8(canvas: array.array) -> bytes:
+    """array('f') RGB 0..1 -> packed 8-bit RGB bytes (rounded, clamped)."""
+    out = bytearray(len(canvas))
+    for i, v in enumerate(canvas):
+        if v <= 0.0:
+            out[i] = 0
+        elif v >= 1.0:
+            out[i] = 255
+        else:
+            out[i] = int(v * 255.0 + 0.5)
+    return bytes(out)

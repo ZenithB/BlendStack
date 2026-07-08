@@ -88,6 +88,13 @@ GIMP's job, and there is no preview in v1 — re-running is cheap):
 At the defaults the result is pixel-identical to the Canon EOS R5's
 in-camera Comparative Bright/Dark selection.
 
+**Live preview.** Tick **Preview** in the dialog to see a small, downscaled
+rendering of the blend that updates as you change the controls. It builds a
+reduced-size copy of the image once (using GIMP's own scaler), then re-folds
+just that small version on each change, so it stays responsive even though
+the fold runs in pure Python. The preview is for judging the look only — the
+committed result is always computed at full resolution when you click OK.
+
 It is also scriptable non-interactively via the PDB as
 `plug-in-blendstack` with arguments `mode` (choice), `softness` (double),
 `bias` (double), `basis` (choice: `per_channel` / `luminance`).
