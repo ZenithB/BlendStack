@@ -47,6 +47,10 @@ darktable 5.6.
      `scripts/blend_cli.py` (e.g. `…/BlendStack`).
    - **BlendStack: output folder** (optional) — where to write the blended
      file; leave empty to write next to the first source image.
+   - **BlendStack: import result into darktable** (default on) — imports the
+     blended file back into the film roll. If importing ever destabilises
+     darktable on your setup, turn this off: the blended file is still
+     written to the folder, and you can import it manually.
 
 ## Usage
 
@@ -81,7 +85,16 @@ darktable 5.6.
 ## How it works
 
 `blendstack.lua` registers an export storage. Its `initialize` validates the
-2–20 selection, `store` collects each rendered file, and `finalize` sorts
-them, calls `scripts/blend_cli.py` (the shared engine) with the chosen mode
-and parameters, imports the resulting TIFF, and cleans up darktable's
-temporary renders.
+2–20 selection **and captures the control values** (on the GUI thread) into
+the per-export `extra_data`; `store` records each rendered file into the same
+`extra_data`; and `finalize` (wrapped in `pcall`) sorts them, calls
+`scripts/blend_cli.py` (the shared engine), imports the resulting TIFF, and
+cleans up darktable's temporary renders.
+
+The export-thread callbacks never read the live GTK widgets and never share
+state through module globals — settings and the file list both travel in the
+per-export `extra_data`. Output filenames are made unique (timestamp +
+per-run counter + existence check). Together these make it safe to run
+several blends at once, and ensure a Lua-level error surfaces as a toast
+rather than crashing darktable (the engine writes the file before the import
+step, so a blend is never lost).
