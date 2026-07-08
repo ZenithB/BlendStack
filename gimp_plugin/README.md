@@ -30,16 +30,23 @@ requirement is NumPy (see below).
    chmod +x ~/Library/Application\ Support/GIMP/3.0/plug-ins/blendstack-blend/blendstack-blend.py
    ```
 
-3. Install NumPy into **GIMP's own** Python interpreter (one time only).
-   GIMP's bundled Python does not ship NumPy, which the blend engine needs
-   for its image maths — this is the only terminal step:
+3. Nothing else to do — **NumPy is bundled with the plugin** (in
+   `blendstack-blend/vendor/`, built by `vendor_numpy.py`), so there is no
+   separate install step.
 
-   ```
-   /Applications/GIMP.app/Contents/MacOS/python3 -m pip install numpy
-   ```
-
-   If you skip this, the plugin still appears in the menu and shows this
-   exact command when run.
+   This is deliberate, not just convenience: on current Apple Silicon
+   macOS, GIMP's bundled `python3.10` **cannot be invoked directly from a
+   shell at all**. macOS Launch Constraints (enforced by AMFI at the
+   kernel level) restrict it to being launched only as a child of the
+   `gimp` process itself — running
+   `/Applications/GIMP.app/Contents/MacOS/python3 -m pip install numpy`
+   (the fix suggested by most online guides, and by brief §6's first
+   mitigation) gets silently killed (`zsh: killed`) regardless of
+   Gatekeeper/quarantine state. Vendoring the wheel (brief §6's second
+   mitigation) sidesteps this entirely: no pip, no network, no directly
+   executing GIMP's constrained interpreter. If the vendored copy is ever
+   missing or ABI-incompatible with your GIMP build, the plugin's error
+   dialog explains how to regenerate it.
 
 4. Restart GIMP.
 
@@ -87,6 +94,11 @@ It is also scriptable non-interactively via the PDB as
 - `sync_core.py` — re-vendors the frozen core
   (`blendstack/__init__.py` + `blendstack/core/`, minus `__pycache__`) into
   `blendstack-blend/blendstack/`. Run it after any core change; never edit
+  the vendored copy by hand.
+- `vendor_numpy.py` — downloads NumPy's official wheel for GIMP's exact
+  interpreter (cp310, macOS arm64) and unpacks it into
+  `blendstack-blend/vendor/numpy/`. Re-run after bumping the pinned
+  version, or if GIMP ever ships a different bundled Python. Never edit
   the vendored copy by hand.
 - `test_plugin_logic.py` — verifies the plugin's numeric path
   (`blend_logic.py`) bit-exact against `blendstack.core.engine` without

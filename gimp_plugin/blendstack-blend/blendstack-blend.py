@@ -33,6 +33,16 @@ _PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
 
+# NumPy is also vendored (./vendor/numpy, see vendor_numpy.py) because on
+# current Apple Silicon macOS, GIMP's bundled python3.10 cannot be invoked
+# directly from a shell at all -- macOS Launch Constraints (AMFI) refuse
+# it, so the "pip install into GIMP's interpreter" one-liner some older
+# guides suggest does not work. Falling back to that instruction (below)
+# only if this vendored copy is somehow missing/incompatible.
+_VENDOR_DIR = os.path.join(_PLUGIN_DIR, "vendor")
+if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
+    sys.path.insert(0, _VENDOR_DIR)
+
 import gi
 
 gi.require_version("Gimp", "3.0")   # 3.0 API is stable across the 3.x series
@@ -57,9 +67,16 @@ NUMPY_INSTALL_CMD = (
     "/Applications/GIMP.app/Contents/MacOS/python3 -m pip install numpy"
 )
 NUMPY_HELP = (
-    "BlendStack needs NumPy, which GIMP's bundled Python does not include "
-    "— install it once into GIMP's own interpreter by running this in "
-    "Terminal, then restart GIMP:\n\n    " + NUMPY_INSTALL_CMD
+    "BlendStack needs NumPy, and the copy normally bundled with this "
+    "plugin (vendor/numpy) is missing or failed to load — reinstall the "
+    "plugin, or run `python3 gimp_plugin/vendor_numpy.py` from the "
+    "BlendStack repo and copy the result back in.\n\n"
+    "If you're on an older GIMP/macOS combination where GIMP's own Python "
+    "can be invoked directly from a terminal, you can alternatively run "
+    "this once and restart GIMP:\n\n    " + NUMPY_INSTALL_CMD +
+    "\n\n(On current Apple Silicon macOS this command is blocked by "
+    "macOS Launch Constraints and will not work — use the vendored copy "
+    "instead.)"
 )
 
 # Fallback mode list used only if the vendored core failed to import
