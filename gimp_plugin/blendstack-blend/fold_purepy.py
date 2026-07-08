@@ -17,8 +17,10 @@ that come straight from / go straight to GEGL:
 * :func:`layer_to_canvas` — place a layer's float pixels on a black,
   canvas-sized background at its offset (intersection-clipped), flattening
   alpha against black (rgb x a), matching the core's load policy.
-* :func:`fold` — left-fold the canvas layers with Canon Bright / Dark,
-  honouring softness, bias and comparison basis, then clip to 0..1.
+* :func:`fold` — left-fold the canvas layers with any of the 7 modes:
+  Canon Bright / Dark (honouring softness, bias and comparison basis),
+  Average (linear-light running mean), Screen, Multiply, Grain Merge and
+  Overlay (continuous gamma-space maths), then clip to 0..1.
 * :func:`to_bytes` — serialise the result for `Gegl.Buffer.set`.
 
 Correctness: for the default case (softness 0, bias 0, per-channel basis)
@@ -42,8 +44,23 @@ from typing import Iterable, List, Sequence, Tuple
 MIN_LAYERS = 2
 MAX_LAYERS = 20
 
-# Fixed v1 mode registry (name -> label). Kept NumPy-free on purpose.
-_MODES = (("canon_bright", "Canon Bright"), ("canon_dark", "Canon Dark"))
+# Mode registry (name -> label), in registration / UI order. Kept NumPy-free
+# on purpose and hand-mirrored from blendstack.core.modes so the pure-Python
+# backend registers exactly the same 7 modes as the NumPy path.
+_MODES = (
+    ("canon_bright", "Canon Bright"),
+    ("canon_dark", "Canon Dark"),
+    ("average", "Average"),
+    ("screen", "Screen"),
+    ("multiply", "Multiply"),
+    ("grain_merge", "Grain Merge"),
+    ("overlay", "Overlay"),
+)
+
+# Continuous modes ignore softness/bias/basis entirely; only the two Canon
+# comparative modes honour them.
+_CANON_MODES = frozenset(("canon_bright", "canon_dark"))
+_CONTINUOUS_MODES = frozenset(("average", "screen", "multiply", "grain_merge", "overlay"))
 
 _LUMA = (0.2126, 0.7152, 0.0722)          # Rec.709 luma (brief §4.1/§4.2)
 _BIAS_SCALE = 0.25 / 100.0                # UI -100..100 -> -0.25..0.25
@@ -53,7 +70,7 @@ Canvas = "array.array"  # length canvas_w*canvas_h*3, float32, RGB interleaved
 
 
 def mode_choices() -> List[Tuple[str, str]]:
-    """(name, label) pairs for the two v1 modes."""
+    """(name, label) pairs for all registered modes, in registration order."""
     return list(_MODES)
 
 
@@ -133,18 +150,96 @@ def fold(
     ``canvases`` are equal-length ``array('f')`` buffers (RGB interleaved);
     the first is the base (its opacity is ignored, per brief §4). Mirrors
     :func:`blendstack.core.engine.fold_images` at opacity 100 for all layers.
-    """
-    if basis not in ("per_channel", "luminance"):
-        raise ValueError(f"Unknown comparison basis '{basis}'")
-    direction = 1 if mode == "canon_bright" else -1
-    bias = float(bias_ui) * _BIAS_SCALE
 
-    acc = canvases[0]
-    for inc in canvases[1:]:
-        acc = _blend_pair(acc, inc, direction, float(softness), bias, basis)
+    ``mode`` selects the maths:
+
+    * ``canon_bright`` / ``canon_dark`` — comparative winner-takes-all,
+      honouring ``softness``, ``bias_ui`` and ``basis`` (Canon-faithful).
+    * ``average`` — running mean in LINEAR light (needs_linear=True): each
+      canvas is sRGB->linear before the fold and the result is re-encoded
+      linear->sRGB, mirroring the engine's scaffolding for this mode.
+    * ``screen`` / ``multiply`` / ``grain_merge`` / ``overlay`` — per-element
+      continuous maths in gamma space.
+
+    All continuous modes IGNORE ``softness`` / ``bias_ui`` / ``basis``.
+    """
+    if mode in _CANON_MODES:
+        if basis not in ("per_channel", "luminance"):
+            raise ValueError(f"Unknown comparison basis '{basis}'")
+        direction = 1 if mode == "canon_bright" else -1
+        bias = float(bias_ui) * _BIAS_SCALE
+        acc = canvases[0]
+        for inc in canvases[1:]:
+            acc = _blend_pair(acc, inc, direction, float(softness), bias, basis)
+    elif mode == "average":
+        # Running mean in linear light. Linearise every canvas first, fold as
+        # a true running mean weighted by 1/(count+1), then re-encode. softness
+        # / bias / basis are ignored for this (and every) continuous mode.
+        lin = [array.array("f", map(_srgb_to_linear, c)) for c in canvases]
+        acc = lin[0]
+        count = 1
+        for inc in lin[1:]:
+            w = 1.0 / (count + 1)
+            acc = array.array("f", (a + (b - a) * w for a, b in zip(acc, inc)))
+            count += 1
+        acc = array.array("f", map(_linear_to_srgb, acc))
+    elif mode == "screen":
+        acc = canvases[0]
+        for inc in canvases[1:]:
+            acc = array.array(
+                "f", (1.0 - (1.0 - a) * (1.0 - b) for a, b in zip(acc, inc))
+            )
+    elif mode == "multiply":
+        acc = canvases[0]
+        for inc in canvases[1:]:
+            acc = array.array("f", (a * b for a, b in zip(acc, inc)))
+    elif mode == "grain_merge":
+        # out = clip(A + B - 0.5, 0, 1), clamped per fold step (matches engine).
+        acc = canvases[0]
+        for inc in canvases[1:]:
+            acc = array.array(
+                "f", (_clip01(a + b - 0.5) for a, b in zip(acc, inc))
+            )
+    elif mode == "overlay":
+        # Order-dependent: branch on the accumulator per element.
+        acc = canvases[0]
+        for inc in canvases[1:]:
+            acc = array.array("f", (
+                (2.0 * a * b) if a < 0.5 else (1.0 - 2.0 * (1.0 - a) * (1.0 - b))
+                for a, b in zip(acc, inc)
+            ))
+    else:
+        raise ValueError(f"Unknown blend mode '{mode}'")
 
     # Final clip to 0..1 (brief §4 pipeline). One pass; returns float32.
     return array.array("f", (0.0 if v < 0.0 else 1.0 if v > 1.0 else v for v in acc))
+
+
+def _clip01(v: float) -> float:
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+
+# --------------------------------------------------------------------------
+# sRGB transfer functions (IEC 61966-2-1 piecewise EOTF, brief §4.1) —
+# pure-Python per-element mirror of blendstack.core.adjustments. Used by the
+# Average mode so its linear-light running mean matches the NumPy engine.
+# Negative inputs clamp to 0; inputs above 1 follow the power-law extension.
+# --------------------------------------------------------------------------
+
+def _srgb_to_linear(x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x <= 0.04045:
+        return x / 12.92
+    return ((x + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(x: float) -> float:
+    if x <= 0.0:
+        return 0.0
+    if x <= 0.0031308:
+        return x * 12.92
+    return 1.055 * x ** (1.0 / 2.4) - 0.055
 
 
 def _blend_pair(acc, inc, direction, softness, bias, basis):

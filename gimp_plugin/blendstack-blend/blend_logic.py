@@ -150,11 +150,16 @@ def fold_visible(
         )
 
     mode_obj = get_mode(mode)
-    params = mode_obj.resolve_params(
+    # Lenient pick: the plugin carries one global param dict (softness/bias/
+    # basis) and reuses it across every mode. ``pick_params`` keeps only the
+    # keys THIS mode declares, so the param-free continuous modes (Average,
+    # Screen, Multiply, Grain Merge, Overlay) don't choke on Canon-only keys.
+    params = mode_obj.pick_params(
         {"softness": float(softness), "bias": float(bias), "basis": str(basis)}
     )
 
     accumulator: np.ndarray | None = None
+    count = 0  # number of images already folded into the accumulator
     for image in layers:
         arr = np.asarray(image)
         if arr.ndim != 3 or arr.shape[2] != 3:
@@ -170,9 +175,13 @@ def fold_visible(
                     f"Layer shape {arr.shape} does not match {accumulator.shape}; "
                     "composite all layers to canvas size first"
                 )
-            # Opacity is 100 % for every layer in the plugin, so the
-            # engine's lerp(accumulator, blended, opacity) is the identity.
-            accumulator = mode_obj.blend(accumulator, arr, params)
+            # Opacity is 100 % for every layer in the plugin, so the engine's
+            # lerp(accumulator, blended, opacity) is the identity. ``count`` is
+            # the number of images already in the accumulator (so the incoming
+            # frame is number count+1) — Average needs it for a true running
+            # mean; other modes ignore it. Matches engine.BlendFold exactly.
+            accumulator = mode_obj.blend(accumulator, arr, params, count=count)
+        count += 1
 
     assert accumulator is not None
     if mode_obj.needs_linear:

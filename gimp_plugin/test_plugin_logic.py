@@ -313,6 +313,132 @@ def test_purepy_metadata_matches():
 
 
 # ---------------------------------------------------------------------------
+# 7b. All 7 modes: both backends match the frozen engine
+# ---------------------------------------------------------------------------
+
+EXPECTED_MODE_ORDER = [
+    ("canon_bright", "Canon Bright"),
+    ("canon_dark", "Canon Dark"),
+    ("average", "Average"),
+    ("screen", "Screen"),
+    ("multiply", "Multiply"),
+    ("grain_merge", "Grain Merge"),
+    ("overlay", "Overlay"),
+]
+
+# Continuous modes fold in float32 (numpy path) / float64 (purepy path); the
+# Average mode additionally round-trips through the sRGB EOTF. Both backends
+# match the engine to within a small float tolerance for these modes; the two
+# Canon comparative modes are bit-exact at default settings.
+_CONTINUOUS = ("average", "screen", "multiply", "grain_merge", "overlay")
+
+
+def test_mode_order_all_seven_both_backends():
+    # fold_purepy and blend_logic (numpy path) list the same 7 modes in the
+    # same order, matching the engine's registration order.
+    assert pp.mode_choices() == EXPECTED_MODE_ORDER
+    assert blend_logic.mode_choices() == EXPECTED_MODE_ORDER
+    assert pp.mode_choices() == blend_logic.mode_choices()
+    assert [n for n, _ in pp.mode_choices()] == list(engine.mode_names())
+
+
+def test_numpy_fold_matches_engine_all_modes():
+    # blend_logic.fold_visible (numpy path) matches engine.fold_images for
+    # every mode. Canon modes are bit-exact; continuous modes allow float
+    # tolerance (float32 fold order + Average's sRGB round-trip).
+    rng = np.random.default_rng(101)
+    imgs = [rng.random((29, 23, 3), dtype=np.float32) for _ in range(6)]
+    for mode in engine.mode_names():
+        expected = engine.fold_images(
+            imgs, mode, {"softness": 0, "bias": 0, "basis": "per_channel"}
+        )
+        got = blend_logic.fold_visible(imgs, mode, 0.0, 0.0, "per_channel")
+        assert got.dtype == np.float32
+        if mode in ("canon_bright", "canon_dark"):
+            assert np.array_equal(got, expected), f"{mode} numpy not bit-exact"
+        else:
+            md = float(np.max(np.abs(got - expected)))
+            assert md < 1e-5, f"{mode} numpy diff {md}"
+
+
+def test_purepy_fold_matches_engine_all_modes():
+    # fold_purepy matches engine.fold_images for every mode. Canon modes are
+    # bit-exact at defaults; the 5 continuous modes allow atol=1e-5 (float32
+    # vs float64 and the sRGB round-trip in Average).
+    rng = np.random.default_rng(202)
+    imgs = [rng.random((24, 18, 3), dtype=np.float32) for _ in range(6)]
+    diffs = {}
+    for mode in engine.mode_names():
+        expected = engine.fold_images(
+            imgs, mode, {"softness": 0, "bias": 0, "basis": "per_channel"}
+        )
+        got = _pp_fold(imgs, mode, 0, 0, "per_channel")
+        md = float(np.max(np.abs(got - expected)))
+        diffs[mode] = md
+        if mode in ("canon_bright", "canon_dark"):
+            assert np.array_equal(got, expected), f"{mode} purepy not bit-exact"
+        else:
+            assert md < 1e-5, f"{mode} purepy diff {md}"
+    # Parity numbers surfaced for the record.
+    print("    purepy-vs-engine max|diff|:",
+          {m: f"{d:.2e}" for m, d in diffs.items()})
+
+
+def test_average_equals_linear_light_mean():
+    # Average is the engine's linear-light running mean (order-independent).
+    rng = np.random.default_rng(303)
+    imgs = [rng.random((20, 16, 3), dtype=np.float32) for _ in range(5)]
+    # Reference: mean of the linearised frames, re-encoded to sRGB.
+    from blendstack.core import adjustments as _adj
+    lin = [_adj.srgb_to_linear(im) for im in imgs]
+    ref = _adj.linear_to_srgb(sum(lin) / len(lin))
+    ref = np.clip(ref, 0.0, 1.0).astype(np.float32)
+    eng = engine.fold_images(imgs, "average",
+                             {"softness": 0, "bias": 0, "basis": "per_channel"})
+    got_np = blend_logic.fold_visible(imgs, "average", 0.0, 0.0, "per_channel")
+    got_pp = _pp_fold(imgs, "average", 0, 0, "per_channel")
+    assert float(np.max(np.abs(eng - ref))) < 1e-5, "engine average != linear mean"
+    assert float(np.max(np.abs(got_np - ref))) < 1e-5, "numpy average != linear mean"
+    assert float(np.max(np.abs(got_pp - ref))) < 1e-5, "purepy average != linear mean"
+    # Order-independent: reversing the stack gives (nearly) the same mean.
+    rev = _pp_fold(list(reversed(imgs)), "average", 0, 0, "per_channel")
+    assert float(np.max(np.abs(got_pp - rev))) < 1e-5, "average is order-dependent"
+
+
+def test_overlay_is_order_dependent():
+    # Overlay branches on the accumulator, so swapping the base changes it.
+    rng = np.random.default_rng(404)
+    imgs = [rng.random((18, 14, 3), dtype=np.float32) for _ in range(3)]
+    a = _pp_fold(imgs, "overlay", 0, 0, "per_channel")
+    b = _pp_fold(list(reversed(imgs)), "overlay", 0, 0, "per_channel")
+    assert float(np.max(np.abs(a - b))) > 1e-3, "overlay should be order-dependent"
+
+
+def test_multiply_screen_order_independent():
+    # Multiply and Screen are commutative/associative -> order-independent.
+    rng = np.random.default_rng(505)
+    imgs = [rng.random((18, 14, 3), dtype=np.float32) for _ in range(4)]
+    for mode in ("multiply", "screen"):
+        a = _pp_fold(imgs, mode, 0, 0, "per_channel")
+        b = _pp_fold(list(reversed(imgs)), mode, 0, 0, "per_channel")
+        assert float(np.max(np.abs(a - b))) < 1e-5, f"{mode} should be order-independent"
+
+
+def test_continuous_modes_ignore_canon_params():
+    # softness/bias/basis must not affect the 5 continuous modes.
+    rng = np.random.default_rng(606)
+    imgs = [rng.random((16, 12, 3), dtype=np.float32) for _ in range(4)]
+    for mode in _CONTINUOUS:
+        base = _pp_fold(imgs, mode, 0, 0, "per_channel")
+        varied = _pp_fold(imgs, mode, 75, -40, "luminance")
+        assert np.array_equal(base, varied), f"{mode} honoured canon params"
+        # numpy path too
+        base_np = blend_logic.fold_visible(imgs, mode, 0, 0, "per_channel")
+        var_np = blend_logic.fold_visible(imgs, mode, 75, -40, "luminance")
+        assert np.array_equal(base_np, var_np), f"{mode} numpy honoured canon params"
+
+
+# ---------------------------------------------------------------------------
 # 8. Preview helpers (in-dialog live preview)
 # ---------------------------------------------------------------------------
 

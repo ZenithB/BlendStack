@@ -7,7 +7,15 @@ Dark).  New modes are added by dropping a module here that defines a
 below.
 """
 
-from . import canon_bright, canon_dark  # noqa: F401  (side effect: registration)
+from . import (  # noqa: F401  (side effect: registration; order = UI order)
+    canon_bright,
+    canon_dark,
+    average,
+    screen,
+    multiply,
+    grain_merge,
+    overlay,
+)
 from .registry import (
     BlendMode,
     ModeParameter,
