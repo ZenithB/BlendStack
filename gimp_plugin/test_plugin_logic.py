@@ -233,6 +233,85 @@ def test_plugin_file_parses_and_is_executable():
                 assert "engine" not in alias.name
 
 
+# ---------------------------------------------------------------------------
+# 7. Pure-Python fallback backend (fold_purepy) — used inside GIMP when
+#    NumPy cannot load. Must match the NumPy engine.
+# ---------------------------------------------------------------------------
+
+import array  # noqa: E402
+import fold_purepy as pp  # noqa: E402
+
+
+def _pp_fold(imgs, mode, soft, bias, basis):
+    h, w = imgs[0].shape[:2]
+    canvases = [array.array("f", im.astype(np.float32).tobytes()) for im in imgs]
+    out = pp.fold(canvases, mode, soft, bias, basis)
+    return np.frombuffer(out.tobytes(), dtype=np.float32).reshape(h, w, 3)
+
+
+def test_purepy_fold_defaults_bit_exact_vs_engine():
+    rng = np.random.default_rng(11)
+    imgs = [rng.random((24, 18, 3)).astype(np.float32) for _ in range(5)]
+    for mode in ("canon_bright", "canon_dark"):
+        eng = engine.fold_images(
+            imgs, mode=mode,
+            params={"softness": 0, "bias": 0, "basis": "per_channel"},
+        )
+        got = _pp_fold(imgs, mode, 0, 0, "per_channel")
+        assert np.array_equal(eng, got), f"{mode} purepy not bit-exact"
+
+
+def test_purepy_fold_soft_bias_luma_close_to_engine():
+    rng = np.random.default_rng(12)
+    imgs = [rng.random((24, 18, 3)).astype(np.float32) for _ in range(4)]
+    cases = [
+        ("canon_bright", 15, 0, "per_channel"),
+        ("canon_dark", 40, -20, "per_channel"),
+        ("canon_bright", 0, 30, "per_channel"),
+        ("canon_bright", 0, 0, "luminance"),
+        ("canon_dark", 25, 10, "luminance"),
+    ]
+    for mode, s, b, basis in cases:
+        eng = engine.fold_images(
+            imgs, mode=mode, params={"softness": s, "bias": b, "basis": basis}
+        )
+        got = _pp_fold(imgs, mode, s, b, basis)
+        md = float(np.max(np.abs(eng - got)))
+        assert md < 1e-5, f"{mode} s={s} b={b} {basis}: diff {md}"
+
+
+def test_purepy_layer_to_canvas_matches_numpy_backend():
+    rng = np.random.default_rng(13)
+    cw, ch = 20, 16
+    cases = [
+        ((10, 8), (5, 4), False),
+        ((12, 10), (-3, -2), False),
+        ((30, 25), (-4, -5), False),
+        ((14, 12), (12, 9), False),
+        ((6, 6), (40, 40), False),
+        ((cw, ch), (0, 0), False),
+        ((10, 8), (3, 3), True),
+        ((12, 10), (-4, -3), True),
+    ]
+    for (lw, lh), (ox, oy), alpha in cases:
+        nc = 4 if alpha else 3
+        layer = rng.random((lh, lw, nc)).astype(np.float32)
+        canv = pp.layer_to_canvas(
+            layer.tobytes(), lw, lh, alpha, ox, oy, cw, ch
+        )
+        got = np.frombuffer(canv.tobytes(), dtype=np.float32).reshape(ch, cw, 3)
+        rgb = blend_logic.flatten_alpha(layer) if alpha else layer
+        exp = blend_logic.composite_at_canvas((cw, ch), rgb, (ox, oy))
+        assert np.array_equal(got, exp), f"purepy composite mismatch {(lw, lh, ox, oy, alpha)}"
+
+
+def test_purepy_metadata_matches():
+    assert pp.MIN_LAYERS == blend_logic.MIN_LAYERS
+    assert pp.MAX_LAYERS == blend_logic.MAX_LAYERS
+    assert pp.mode_choices() == blend_logic.mode_choices()
+    assert pp.mode_label("canon_bright") == "Canon Bright"
+
+
 def main() -> int:
     tests = [
         (name, fn) for name, fn in sorted(globals().items())

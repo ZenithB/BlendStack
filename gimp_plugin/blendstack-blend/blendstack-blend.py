@@ -19,29 +19,25 @@ monotone-invariant (brief §1), and it makes 8-, 16- and 32-bit images all
 work identically.  Layers with alpha are read as "R'G'B'A float" and
 flattened against black (rgb × a) to match core behaviour.
 
-All numeric work lives in ``blend_logic.py`` (GIMP-independent, tested
-outside GIMP bit-exact against the core engine).  The frozen core package
-is vendored alongside this file by ``gimp_plugin/sync_core.py``.
+Backends: the numeric work runs through one of two interchangeable
+backends, chosen at load time.  When NumPy imports, ``blend_logic.py``
+(the frozen core vendored by ``gimp_plugin/sync_core.py``) does the maths.
+When NumPy cannot load — the usual case inside GIMP on Apple Silicon,
+where the hardened-runtime interpreter's library validation rejects
+NumPy's ad-hoc-signed C extensions — the stdlib-only ``fold_purepy.py``
+backend runs instead (brief §6 mitigation 3): slower, but dependency-free
+and bit-exact with the engine at default settings.  Either way the plugin
+always registers and always runs.
 """
 
 import os
 import sys
 
-# The vendored core (./blendstack/) and blend_logic.py live next to this
-# file; GIMP does not put the plugin folder on sys.path automatically.
+# The vendored core (./blendstack/), blend_logic.py and fold_purepy.py live
+# next to this file; GIMP does not put the plugin folder on sys.path itself.
 _PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
 if _PLUGIN_DIR not in sys.path:
     sys.path.insert(0, _PLUGIN_DIR)
-
-# NumPy is also vendored (./vendor/numpy, see vendor_numpy.py) because on
-# current Apple Silicon macOS, GIMP's bundled python3.10 cannot be invoked
-# directly from a shell at all -- macOS Launch Constraints (AMFI) refuse
-# it, so the "pip install into GIMP's interpreter" one-liner some older
-# guides suggest does not work. Falling back to that instruction (below)
-# only if this vendored copy is somehow missing/incompatible.
-_VENDOR_DIR = os.path.join(_PLUGIN_DIR, "vendor")
-if os.path.isdir(_VENDOR_DIR) and _VENDOR_DIR not in sys.path:
-    sys.path.insert(0, _VENDOR_DIR)
 
 import gi
 
@@ -50,47 +46,44 @@ gi.require_version("GimpUi", "3.0")
 gi.require_version("Gegl", "0.4")
 from gi.repository import Gegl, Gimp, GimpUi, GLib, GObject  # noqa: E402
 
-# NumPy may be missing from GIMP's bundled Python (brief §6 known risk).
-# Register the procedure regardless; the run() handler reports the fix.
-_IMPORT_ERROR = None
+# fold_purepy is the stdlib-only fallback backend and the source of the mode
+# metadata + layer limits. It has no dependencies, so it always imports and
+# the plugin always registers and runs.
+import fold_purepy  # noqa: E402
+
+# NumPy is the fast path. On Apple Silicon macOS it usually CANNOT load
+# inside GIMP: GIMP's bundled Python runs under a hardened runtime that
+# enforces library validation, which rejects NumPy's ad-hoc-signed C
+# extensions ("Library Validation failed ... different Team IDs"). There is
+# no way to make it load without re-signing GIMP itself, so we do NOT ship a
+# NumPy wheel (it can't load) — we fall back to fold_purepy (brief §6
+# mitigation 3). Where NumPy *does* load (Linux/Windows/Intel, or a GIMP
+# built without library validation), we use it automatically for speed.
+_NUMPY_ERROR = None
 try:
     import numpy as np
     import blend_logic
-except ImportError as exc:  # pragma: no cover - exercised only inside GIMP
+except Exception as exc:  # pragma: no cover - path depends on the host
     np = None
     blend_logic = None
-    _IMPORT_ERROR = str(exc)
+    _NUMPY_ERROR = str(exc)
+
+USE_NUMPY = np is not None and blend_logic is not None
 
 PROC_NAME = "plug-in-blendstack"
 
-NUMPY_INSTALL_CMD = (
-    "/Applications/GIMP.app/Contents/MacOS/python3 -m pip install numpy"
-)
-NUMPY_HELP = (
-    "BlendStack needs NumPy, and the copy normally bundled with this "
-    "plugin (vendor/numpy) is missing or failed to load — reinstall the "
-    "plugin, or run `python3 gimp_plugin/vendor_numpy.py` from the "
-    "BlendStack repo and copy the result back in.\n\n"
-    "If you're on an older GIMP/macOS combination where GIMP's own Python "
-    "can be invoked directly from a terminal, you can alternatively run "
-    "this once and restart GIMP:\n\n    " + NUMPY_INSTALL_CMD +
-    "\n\n(On current Apple Silicon macOS this command is blocked by "
-    "macOS Launch Constraints and will not work — use the vendored copy "
-    "instead.)"
-)
-
-# Fallback mode list used only if the vendored core failed to import
-# (e.g. NumPy missing) so the procedure still registers with sane args.
-_FALLBACK_MODES = (("canon_bright", "Canon Bright"), ("canon_dark", "Canon Dark"))
+# Layer limits + mode metadata come from fold_purepy so they are available
+# whether or not NumPy loaded.
+MIN_LAYERS = fold_purepy.MIN_LAYERS
+MAX_LAYERS = fold_purepy.MAX_LAYERS
 
 
 def _mode_choices():
-    if blend_logic is not None:
-        try:
-            return blend_logic.mode_choices()
-        except Exception:
-            pass
-    return list(_FALLBACK_MODES)
+    return fold_purepy.mode_choices()
+
+
+def _mode_label(mode):
+    return fold_purepy.mode_label(mode)
 
 
 def _error(procedure, message):
@@ -168,13 +161,9 @@ class BlendStack(Gimp.PlugIn):
     def run(self, procedure, run_mode, image, drawables, config, run_data):
         # GIMP 3.0.x ImageProcedure run signature:
         # (procedure, run_mode, image, drawables, config, run_data).
-        if blend_logic is None or np is None:
-            message = f"{NUMPY_HELP}\n\n(Python import error: {_IMPORT_ERROR})"
-            if run_mode == Gimp.RunMode.INTERACTIVE:
-                GimpUi.init("blendstack-blend")
-                Gimp.message(message)
-            return _error(procedure, message)
-
+        # NumPy is optional: when it can't load (the usual case inside GIMP
+        # on Apple Silicon), the stdlib fold_purepy backend runs instead, so
+        # there is no hard failure here.
         if run_mode == Gimp.RunMode.INTERACTIVE:
             GimpUi.init("blendstack-blend")
             dialog = GimpUi.ProcedureDialog.new(procedure, config, "BlendStack")
@@ -206,16 +195,16 @@ class BlendStack(Gimp.PlugIn):
 
         # get_layers() is top-first in GIMP 3; brief §6: top layer = base.
         visible = [layer for layer in image.get_layers() if layer.get_visible()]
-        if len(visible) < blend_logic.MIN_LAYERS:
+        if len(visible) < MIN_LAYERS:
             return _error(
                 procedure,
-                f"BlendStack needs at least {blend_logic.MIN_LAYERS} visible "
+                f"BlendStack needs at least {MIN_LAYERS} visible "
                 f"layers to blend; this image has {len(visible)}.",
             )
-        if len(visible) > blend_logic.MAX_LAYERS:
+        if len(visible) > MAX_LAYERS:
             return _error(
                 procedure,
-                f"BlendStack blends at most {blend_logic.MAX_LAYERS} layers "
+                f"BlendStack blends at most {MAX_LAYERS} layers "
                 f"(engine limit); this image has {len(visible)} visible — "
                 "hide some layers and re-run.",
             )
@@ -224,15 +213,21 @@ class BlendStack(Gimp.PlugIn):
 
         # Read every visible layer as float via its GEGL buffer, flatten
         # alpha against black, and composite onto a black canvas-sized
-        # background at the layer's offsets (brief §6).
-        arrays = []
-        for layer in visible:
-            arrays.append(self._read_layer(layer, canvas_w, canvas_h))
-
-        result = blend_logic.fold_visible(arrays, mode, softness, bias, basis)
+        # background at the layer's offsets (brief §6). Both backends produce
+        # canvas-sized layers; the fold then combines them.
+        if USE_NUMPY:
+            layers = [self._read_layer_np(l, canvas_w, canvas_h) for l in visible]
+            result_bytes = blend_logic.fold_visible(
+                layers, mode, softness, bias, basis
+            ).tobytes()
+        else:
+            layers = [self._read_layer_pp(l, canvas_w, canvas_h) for l in visible]
+            result_bytes = fold_purepy.to_bytes(
+                fold_purepy.fold(layers, mode, softness, bias, basis)
+            )
 
         # Insert the composite as a new top layer inside one undo group.
-        label = blend_logic.mode_label(mode)
+        label = _mode_label(mode)
         image.undo_group_start()
         try:
             new_layer = Gimp.Layer.new(
@@ -247,7 +242,7 @@ class BlendStack(Gimp.PlugIn):
             image.insert_layer(new_layer, None, 0)  # position 0 = top
             buffer = new_layer.get_buffer()
             rect = Gegl.Rectangle.new(0, 0, canvas_w, canvas_h)
-            buffer.set(rect, "R'G'B' float", result.tobytes())
+            buffer.set(rect, "R'G'B' float", result_bytes)
             buffer.flush()
             new_layer.update(0, 0, canvas_w, canvas_h)
         finally:
@@ -259,25 +254,39 @@ class BlendStack(Gimp.PlugIn):
         )
 
     @staticmethod
-    def _read_layer(layer, canvas_w, canvas_h):
-        """Layer -> float32 (canvas_h, canvas_w, 3) on black background."""
+    def _layer_float_bytes(layer):
+        """(raw float32 bytes, w, h, has_alpha, off_x, off_y) for a layer."""
         layer_w, layer_h = layer.get_width(), layer.get_height()
         buffer = layer.get_buffer()
         rect = Gegl.Rectangle.new(0, 0, layer_w, layer_h)
-        if layer.has_alpha():
-            data = buffer.get(rect, 1.0, "R'G'B'A float", Gegl.AbyssPolicy.NONE)
-            rgba = np.frombuffer(data, dtype=np.float32).reshape(layer_h, layer_w, 4)
+        has_alpha = layer.has_alpha()
+        fmt = "R'G'B'A float" if has_alpha else "R'G'B' float"
+        data = buffer.get(rect, 1.0, fmt, Gegl.AbyssPolicy.NONE)
+        offsets = layer.get_offsets()
+        # GIMP 3 returns (success, offset_x, offset_y); tolerate bindings
+        # that drop the leading boolean.
+        off_x, off_y = int(offsets[-2]), int(offsets[-1])
+        return data, layer_w, layer_h, has_alpha, off_x, off_y
+
+    @classmethod
+    def _read_layer_np(cls, layer, canvas_w, canvas_h):
+        """NumPy path: layer -> float32 (canvas_h, canvas_w, 3) on black."""
+        data, w, h, has_alpha, off_x, off_y = cls._layer_float_bytes(layer)
+        if has_alpha:
+            rgba = np.frombuffer(data, dtype=np.float32).reshape(h, w, 4)
             rgb = blend_logic.flatten_alpha(rgba)
         else:
-            data = buffer.get(rect, 1.0, "R'G'B' float", Gegl.AbyssPolicy.NONE)
-            rgb = np.frombuffer(data, dtype=np.float32).reshape(layer_h, layer_w, 3)
-
-        offsets = layer.get_offsets()
-        # GIMP 3 returns (success, offset_x, offset_y); be tolerant of
-        # bindings that drop the boolean.
-        off_x, off_y = (offsets[-2], offsets[-1])
+            rgb = np.frombuffer(data, dtype=np.float32).reshape(h, w, 3)
         return blend_logic.composite_at_canvas(
-            (canvas_w, canvas_h), rgb, (int(off_x), int(off_y))
+            (canvas_w, canvas_h), rgb, (off_x, off_y)
+        )
+
+    @classmethod
+    def _read_layer_pp(cls, layer, canvas_w, canvas_h):
+        """Pure-Python path: layer -> array('f') canvas on black background."""
+        data, w, h, has_alpha, off_x, off_y = cls._layer_float_bytes(layer)
+        return fold_purepy.layer_to_canvas(
+            data, w, h, has_alpha, off_x, off_y, canvas_w, canvas_h
         )
 
 

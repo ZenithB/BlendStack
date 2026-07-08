@@ -63,11 +63,13 @@ Drag images in (TIFF, JPEG, PNG, GIF, BMP, WebP, RAW), reorder the strip (top = 
 ## GIMP plugin
 
 Copy `gimp_plugin/blendstack-blend/` into your GIMP 3 plug-ins directory
-(`~/Library/Application Support/GIMP/3.0/plug-ins/` on macOS) and make the
+(`~/Library/Application Support/GIMP/3.2/plug-ins/` on macOS — check
+**Edit ▸ Preferences ▸ Folders ▸ Plug-ins** for the exact path) and make the
 script executable, then find it under **Filters → Combine → BlendStack…**.
 It blends all visible layers (top layer = base) and inserts the result as a
-new top layer. Full install notes, including the one-time NumPy install for
-GIMP's bundled Python, are in [gimp_plugin/README.md](gimp_plugin/README.md).
+new top layer. No dependency install is needed — the plugin ships a
+stdlib-only fallback and uses NumPy automatically only where GIMP's Python
+can load it. Full notes are in [gimp_plugin/README.md](gimp_plugin/README.md).
 
 ## Tests
 
