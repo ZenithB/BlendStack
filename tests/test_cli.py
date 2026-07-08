@@ -24,6 +24,43 @@ def _load_cli():
     return module
 
 
+def _load_blend_cli():
+    spec = importlib.util.spec_from_file_location(
+        "blend_cli", REPO_ROOT / "scripts" / "blend_cli.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules["blend_cli"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_blend_cli_explicit_list_and_order(tmp_path: Path, capsys) -> None:
+    """scripts/blend_cli.py blends an explicit ordered file list (used by
+    the darktable integration)."""
+    cli = _load_blend_cli()
+    Image.new("RGB", (10, 8), (10, 20, 30)).save(tmp_path / "a.png")
+    Image.new("RGB", (10, 8), (200, 150, 100)).save(tmp_path / "b.png")
+    out = tmp_path / "avg.tif"
+    rc = cli.main(
+        ["--mode", "average", "--out", str(out),
+         str(tmp_path / "a.png"), str(tmp_path / "b.png")]
+    )
+    assert rc == 0
+    printed = capsys.readouterr().out.strip().splitlines()[-1]
+    assert printed.startswith("OK ")           # machine-readable success line
+    arr = iio.imread(out)
+    assert arr.shape == (8, 10, 3) and arr.dtype == np.uint16
+
+
+def test_blend_cli_rejects_single_image(tmp_path: Path) -> None:
+    cli = _load_blend_cli()
+    Image.new("RGB", (8, 8), (0, 0, 0)).save(tmp_path / "solo.png")
+    out = tmp_path / "x.tif"
+    with __import__("pytest").raises(SystemExit):
+        cli.main(["--mode", "multiply", "--out", str(out), str(tmp_path / "solo.png")])
+
+
 def test_blend_folder_end_to_end(tmp_path: Path, capsys) -> None:
     # a.png dark, b.png bright — sorted by name, canon_bright must pick b.
     Image.new("RGB", (12, 10), (10, 20, 30)).save(tmp_path / "a.png")

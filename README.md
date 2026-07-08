@@ -2,10 +2,11 @@
 
 A standalone image blending tool that faithfully recreates the Canon EOS R5's in-camera multiple exposure blend modes — **Comparative Bright** and **Comparative Dark** — with per-image adjustments and creative controls the camera does not offer.
 
-Two frontends over one shared engine:
+Three frontends over one shared engine:
 
 - **macOS desktop app** (PySide6) — drag-and-drop, reorderable image list, live preview, composite histogram, presets, 16-bit export.
-- **GIMP 3.2 plugin** — blends all visible layers of the open image and inserts the result as a new top layer.
+- **GIMP 3.2 plugin** — blends all visible layers of the open image and inserts the result as a new top layer, with a live preview.
+- **darktable Lua integration** — select images in lighttable, develop them, and blend the developed exports from the export panel; the result is imported back into your film roll.
 
 ## Why "Canon-faithful"?
 
@@ -26,9 +27,10 @@ blendstack/
 ├── core/          # Pure engine — NumPy pipeline, blend mode registry, IO, geometry
 ├── app/           # PySide6 standalone macOS app
 gimp_plugin/       # GIMP 3.2 plugin (GObject Introspection) + install README
+darktable_plugin/  # darktable 5.x Lua export integration + install README
 packaging/         # PyInstaller spec + build script for the distributable .app
-scripts/           # CLI test harness (blend a folder of images)
-tests/             # Engine acceptance tests (68 tests)
+scripts/           # CLIs: blend a folder, or an explicit ordered file list
+tests/             # Engine + CLI acceptance tests
 docs/              # Project brief / specification
 ```
 
@@ -70,6 +72,18 @@ It blends all visible layers (top layer = base) and inserts the result as a
 new top layer. No dependency install is needed — the plugin ships a
 stdlib-only fallback and uses NumPy automatically only where GIMP's Python
 can load it. Full notes are in [gimp_plugin/README.md](gimp_plugin/README.md).
+
+## darktable integration
+
+darktable's darkroom is single-image, so BlendStack plugs in as a **Lua
+export storage** (the way darktable's HDR/enfuse tools do): select images in
+lighttable, then in the export panel set the target to **BlendStack**.
+darktable develops and exports each frame, BlendStack blends the developed
+results, and the output is imported back into your film roll — so your
+darktable edits are applied first, then the multi-image blend. Copy
+`darktable_plugin/blendstack.lua` to `~/.config/darktable/lua/` and add
+`require "blendstack"` to `~/.config/darktable/luarc`. Full notes are in
+[darktable_plugin/README.md](darktable_plugin/README.md).
 
 ## Tests
 
