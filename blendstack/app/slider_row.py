@@ -15,6 +15,31 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget
 
 __all__ = ["SliderRow"]
 
+# The native macOS slider knob (~20 px) overflows the tight row spacing and
+# clips into the rows above/below. Style a smaller circular handle (~15 px,
+# i.e. ~5 px smaller) over a thin groove. Styling any sub-control switches
+# the whole slider to styled rendering, so groove + handle are both defined;
+# palette() keeps it correct in light and dark themes.
+_HANDLE_PX = 15
+_SLIDER_QSS = f"""
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: palette(mid);
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: palette(button);
+    border: 1px solid palette(mid);
+    width: {_HANDLE_PX}px;
+    height: {_HANDLE_PX}px;
+    border-radius: {_HANDLE_PX // 2}px;
+    margin: -{(_HANDLE_PX - 4) // 2}px 0;
+}}
+QSlider::handle:horizontal:hover {{
+    border-color: palette(highlight);
+}}
+"""
+
 
 class SliderRow(QWidget):
     """Label + value readout above a horizontal slider."""
@@ -38,6 +63,7 @@ class SliderRow(QWidget):
 
         self.slider = QSlider(Qt.Horizontal, self)
         self.slider.setRange(minimum, maximum)
+        self.slider.setStyleSheet(_SLIDER_QSS)
         self._name_label = QLabel(label, self)
         self._value_label = QLabel(self)
         self._value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
