@@ -102,8 +102,10 @@ class BlendFold:
     def __init__(self, mode: str = "canon_bright",
                  params: Mapping[str, Any] | None = None) -> None:
         self._mode: BlendMode = get_mode(mode)
-        # Resolve immediately: fills defaults and rejects unknown names.
-        self._params: dict[str, Any] = self._mode.resolve_params(params)
+        # Lenient: frontends pass one global param dict (softness/bias/basis)
+        # across all modes; keep only the keys THIS mode declares so a
+        # parameter-free mode (Multiply, Screen, …) does not choke on them.
+        self._params: dict[str, Any] = self._mode.pick_params(params)
         self._accumulator: Optional[np.ndarray] = None
         self._count = 0
 
@@ -128,7 +130,11 @@ class BlendFold:
                     f"Image shape {image.shape} does not match accumulator "
                     f"{self._accumulator.shape}; run the geometry step first"
                 )
-            blended = self._mode.blend(self._accumulator, image, self._params)
+            # count = images already folded into the accumulator, so the
+            # incoming image is number count+1 (needed by Average).
+            blended = self._mode.blend(
+                self._accumulator, image, self._params, count=self._count
+            )
             k = float(opacity) / 100.0
             if k >= 1.0:
                 self._accumulator = blended

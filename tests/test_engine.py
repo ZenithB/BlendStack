@@ -230,14 +230,19 @@ class TestLinearScaffolding:
             needs_linear = True
             parameters: tuple[ModeParameter, ...] = ()
 
-            def blend(self, accumulator, incoming, params=None):  # type: ignore[override]
+            def blend(self, accumulator, incoming, params=None, count=1):  # type: ignore[override]
                 captured["acc"] = accumulator
                 captured["inc"] = incoming
+                captured["count"] = count
                 return incoming
 
         a = np.full((4, 4, 3), 0.5, dtype=np.float32)
         b = np.full((4, 4, 3), 0.25, dtype=np.float32)
         out = engine.blend_arrays([a, b], mode="_test_linear_probe")
+
+        # The fold reports how many images are already in the accumulator
+        # (one, the base) when the second image arrives.
+        assert captured["count"] == 1
 
         # The fold must have received sRGB-linearised data...
         assert np.allclose(captured["acc"], srgb_to_linear(a), atol=1e-7)

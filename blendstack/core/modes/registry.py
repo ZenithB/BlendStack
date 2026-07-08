@@ -66,11 +66,18 @@ class BlendMode(abc.ABC):
         accumulator: np.ndarray,
         incoming: np.ndarray,
         params: Mapping[str, Any] | None = None,
+        count: int = 1,
     ) -> np.ndarray:
         """Fold one incoming image into the accumulator.
 
         Both arrays are float32 RGB, shape (H, W, 3), values nominally 0–1.
         Must return a new array; must not mutate its inputs.
+
+        ``count`` is the number of source images already represented by
+        ``accumulator`` (so ``incoming`` is image number ``count + 1``).
+        Most modes ignore it; running-aggregate modes such as Average need
+        it to weight the incoming image correctly (e.g. a true mean must
+        weight the new frame by ``1 / (count + 1)``).
         """
 
     @classmethod
@@ -94,6 +101,24 @@ class BlendMode(abc.ABC):
                     f"declared: {sorted(resolved)}"
                 )
             resolved.update(params)
+        return resolved
+
+    @classmethod
+    def pick_params(cls, params: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Like :meth:`resolve_params` but *lenient*: keep only the keys this
+        mode declares and silently ignore any others.
+
+        Frontends carry one global parameter dict (e.g. softness/bias/basis)
+        and reuse it across modes; a mode that declares none of those keys
+        (Multiply, Screen, …) must not choke on them. Use this at the fold
+        call site; use :meth:`resolve_params` where an unexpected key really
+        is a bug worth surfacing.
+        """
+        resolved = cls.default_params()
+        if params:
+            for name in resolved:
+                if name in params:
+                    resolved[name] = params[name]
         return resolved
 
 

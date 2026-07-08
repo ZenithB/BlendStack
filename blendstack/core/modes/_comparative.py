@@ -85,7 +85,9 @@ class ComparativeMode(BlendMode):
         accumulator: np.ndarray,
         incoming: np.ndarray,
         params: Mapping[str, Any] | None = None,
+        count: int = 1,
     ) -> np.ndarray:
+        del count  # comparative select is pairwise; frame count is irrelevant
         p = self.resolve_params(params)
         softness = float(p["softness"])
         bias = float(p["bias"]) * _BIAS_SCALE
