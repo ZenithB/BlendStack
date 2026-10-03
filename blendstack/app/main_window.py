@@ -18,14 +18,16 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QScrollArea,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -106,7 +108,7 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("BlendStack")
-        self.resize(1280, 800)
+        self._apply_initial_geometry()
         self.setAcceptDrops(True)
 
         self.state = DocumentState(self)
@@ -131,15 +133,30 @@ class MainWindow(QMainWindow):
         strip_column.addWidget(strip_label)
         strip_column.addWidget(self.strip, 1)
 
+        # The control panels live in a vertical scroll area so their combined
+        # height can never set the window's minimum height. Without this the
+        # stacked panels forced a minimum taller than a laptop screen, which
+        # made macOS pin the window to the top and refuse vertical resizing.
+        # The histogram stays outside the scroll area so it is always visible.
+        controls = QWidget(self)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.addWidget(self.adjustments_panel)
+        controls_layout.addWidget(self.blend_controls)
+        controls_layout.addStretch(1)
+        self.controls_scroll = QScrollArea(self)
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setFrameShape(QFrame.NoFrame)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.controls_scroll.setWidget(controls)
+
         right_column = QVBoxLayout()
-        right_column.addWidget(self.adjustments_panel)
-        right_column.addWidget(self.blend_controls)
-        right_column.addStretch(1)
+        right_column.addWidget(self.controls_scroll, 1)
         right_column.addWidget(QLabel("Composite histogram", self))
         right_column.addWidget(self.histogram)
         right = QWidget(self)
         right.setLayout(right_column)
-        right.setFixedWidth(300)
+        right.setFixedWidth(330)
 
         central = QWidget(self)
         layout = QHBoxLayout(central)
@@ -180,6 +197,25 @@ class MainWindow(QMainWindow):
         self.canvas.clear()
 
     # ------------------------------------------------------------------ toolbar
+
+    def _apply_initial_geometry(self) -> None:
+        """Open at a comfortable size that always fits the screen, centred.
+
+        The window stays freely movable and resizable afterwards: no fixed or
+        oversized minimum is set, so it can be shrunk well below this size.
+        """
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:  # no screen info (rare): keep a sane default
+            self.resize(1280, 800)
+            return
+        avail = screen.availableGeometry()
+        width = min(1280, int(avail.width() * 0.92))
+        height = min(800, int(avail.height() * 0.88))
+        self.resize(width, height)
+        self.move(
+            avail.x() + (avail.width() - width) // 2,
+            avail.y() + (avail.height() - height) // 2,
+        )
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main", self)
