@@ -3,7 +3,14 @@
 Layout: left = reorderable image strip (fold order, top = base image);
 centre = live preview canvas; right = per-image adjustments panel, global
 blend controls and the composite histogram.  Toolbar: Open, Save Preset,
-Load Preset, Export.
+Load Preset, Export and the checkable **Move / Crop** tool (key M).
+
+Move / Crop tool (on): the preview shows the FULL canvas; dragging in the
+preview moves the selected image (``move_x`` / ``move_y`` fractions, stored in
+its :class:`Adjustments`); double-clicking enters crop mode (rectangle with 8
+handles; Apply / Cancel / Reset crop in a slim bar under the canvas, Enter /
+Esc as shortcuts).  Solo (per-row "S" in the image strip) previews one image
+in isolation.  Export honours placement and crop.
 
 Export (brief §5 / §4.4) runs the **full-resolution** pipeline via
 ``engine.blend_files`` (streams one file at a time, memory-bounded) on a
@@ -13,12 +20,13 @@ thread is never blocked.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication
+from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -27,6 +35,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QPushButton,
     QScrollArea,
     QToolBar,
     QVBoxLayout,
@@ -37,7 +46,7 @@ from blendstack.core import engine
 from blendstack.core import io as bs_io
 from blendstack.core.adjustments import Adjustments
 
-from . import presets
+from . import canvas_tools, presets
 from .adjustments_panel import AdjustmentsPanel
 from .blend_controls import BlendControls
 from .histogram import HistogramWidget
@@ -73,6 +82,7 @@ class _ExportWorker(QObject):
         adjustments: Sequence[Adjustments],
         out_path: Path,
         out_format: str,
+        crop: Optional[Sequence[float]] = None,
     ) -> None:
         super().__init__()
         self._paths = list(paths)
@@ -81,6 +91,7 @@ class _ExportWorker(QObject):
         self._adjustments = list(adjustments)
         self._out_path = out_path
         self._out_format = out_format
+        self._crop = None if crop is None else tuple(crop)
 
     @Slot()
     def run(self) -> None:
@@ -92,6 +103,7 @@ class _ExportWorker(QObject):
                 adjustments=self._adjustments,
                 out_path=self._out_path,
                 out_format=self._out_format,
+                crop=self._crop,
             )
         except Exception as exc:  # noqa: BLE001 — surfaced in a dialog
             self.failed.emit(str(exc) or type(exc).__name__)
@@ -119,6 +131,8 @@ class MainWindow(QMainWindow):
         self._export_thread: Optional[QThread] = None
         self._export_worker: Optional[_ExportWorker] = None
         self._export_progress: Optional[QProgressDialog] = None
+        #: (entry_id, move_x, move_y) captured when a layer drag starts.
+        self._move_base: Optional[tuple[int, float, float]] = None
 
         # -- widgets ---------------------------------------------------------
         self.strip = ImageStrip(self)
@@ -158,14 +172,47 @@ class MainWindow(QMainWindow):
         right.setLayout(right_column)
         right.setFixedWidth(330)
 
+        # Slim crop bar attached under the canvas; visible only in crop mode.
+        self.crop_bar = QFrame(self)
+        self.crop_bar.setFrameShape(QFrame.StyledPanel)
+        crop_bar_layout = QHBoxLayout(self.crop_bar)
+        crop_bar_layout.setContentsMargins(8, 2, 8, 2)
+        crop_bar_layout.addWidget(QLabel("Crop", self.crop_bar))
+        crop_bar_layout.addStretch(1)
+        self.reset_crop_button = QPushButton("Reset crop", self.crop_bar)
+        self.cancel_crop_button = QPushButton("Cancel", self.crop_bar)
+        self.apply_crop_button = QPushButton("Apply", self.crop_bar)
+        self.reset_crop_button.setToolTip("Remove the applied crop")
+        self.cancel_crop_button.setToolTip("Discard this crop edit (Esc)")
+        self.apply_crop_button.setToolTip("Apply the crop (Enter)")
+        self.apply_crop_button.setDefault(True)
+        for button in (self.reset_crop_button, self.cancel_crop_button,
+                       self.apply_crop_button):
+            crop_bar_layout.addWidget(button)
+        self.crop_bar.hide()
+
+        canvas_column = QVBoxLayout()
+        canvas_column.setContentsMargins(0, 0, 0, 0)
+        canvas_column.setSpacing(0)
+        canvas_column.addWidget(self.canvas, 1)
+        canvas_column.addWidget(self.crop_bar)
+
         central = QWidget(self)
         layout = QHBoxLayout(central)
         layout.addLayout(strip_column)
-        layout.addWidget(self.canvas, 1)
+        layout.addLayout(canvas_column, 1)
         layout.addWidget(right)
         self.setCentralWidget(central)
 
         self._build_toolbar()
+        # Enter = Apply / Esc = Cancel, active only while cropping.
+        self._crop_shortcuts = [
+            QShortcut(QKeySequence(key), self, self._apply_crop)
+            for key in (Qt.Key_Return, Qt.Key_Enter)
+        ] + [QShortcut(QKeySequence(Qt.Key_Escape), self, self._cancel_crop)]
+        for shortcut in self._crop_shortcuts:
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.setEnabled(False)
 
         # -- preview controller (background render thread, brief §5) ---------
         self.preview = PreviewController(self.state, self)
@@ -183,15 +230,29 @@ class MainWindow(QMainWindow):
             )
         )
         self.state.adjustments_changed.connect(self._on_state_adjustments)
+        self.state.solo_changed.connect(self._on_solo_changed)
+        self.state.crop_changed.connect(self._on_crop_changed)
 
         # -- wiring: UI -> state ------------------------------------------------
         self.strip.files_dropped.connect(self.add_files)
         self.strip.order_changed.connect(self.state.reorder)
         self.strip.remove_requested.connect(self.state.remove)
         self.strip.selection_changed.connect(self._on_selection_changed)
+        self.strip.solo_requested.connect(self.state.set_solo)
+        self.strip.reset_position_requested.connect(self.state.reset_placement)
         self.adjustments_panel.adjustments_edited.connect(self._on_panel_edited)
         self.blend_controls.mode_changed.connect(self.state.set_mode)
         self.blend_controls.param_changed.connect(self.state.set_param)
+
+        # -- wiring: Move / Crop tool -------------------------------------------
+        self.move_crop_action.toggled.connect(self._on_tool_toggled)
+        self.canvas.drag_started.connect(self._on_move_started)
+        self.canvas.drag_moved.connect(self._on_move_dragged)
+        self.canvas.drag_finished.connect(self._on_move_finished)
+        self.canvas.crop_mode_changed.connect(self._on_crop_mode_changed)
+        self.apply_crop_button.clicked.connect(self._apply_crop)
+        self.cancel_crop_button.clicked.connect(self._cancel_crop)
+        self.reset_crop_button.clicked.connect(self._reset_crop)
 
         self.blend_controls.set_from_state(self.state.mode, self.state.params)
         self.canvas.clear()
@@ -231,6 +292,13 @@ class MainWindow(QMainWindow):
         self.load_preset_action.triggered.connect(self._load_preset_dialog)
         self.export_action = QAction("Export…", self)
         self.export_action.triggered.connect(self._export_dialog)
+        self.move_crop_action = QAction("Move / Crop", self)
+        self.move_crop_action.setCheckable(True)
+        self.move_crop_action.setShortcut(QKeySequence("M"))
+        self.move_crop_action.setToolTip(
+            "Move / Crop (M) — drag to move the selected image; "
+            "double-click the canvas to crop"
+        )
         for action in (
             self.open_action,
             self.save_preset_action,
@@ -238,6 +306,8 @@ class MainWindow(QMainWindow):
             self.export_action,
         ):
             toolbar.addAction(action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.move_crop_action)
 
     # -------------------------------------------------------------- notifications
 
@@ -296,7 +366,15 @@ class MainWindow(QMainWindow):
 
     def _on_panel_edited(self, adjustments: Adjustments) -> None:
         entry_id = self.strip.current_entry_id()
-        if entry_id is not None:
+        entry = None if entry_id is None else self.state.entry(entry_id)
+        if entry is not None:
+            # Placement belongs to the canvas Move tool: whatever the panel
+            # emits, never let it clobber the layer's position.
+            adjustments = replace(
+                adjustments,
+                move_x=entry.adjustments.move_x,
+                move_y=entry.adjustments.move_y,
+            )
             self.state.set_adjustments(entry_id, adjustments)
 
     def _on_state_adjustments(self, entry_id: int) -> None:
@@ -304,12 +382,95 @@ class MainWindow(QMainWindow):
         if entry_id == self.strip.current_entry_id():
             entry = self.state.entry(entry_id)
             if entry is not None:
-                self.adjustments_panel.set_values(entry.adjustments)
+                current = entry.adjustments
+                shown = replace(
+                    self.adjustments_panel.values(),
+                    move_x=current.move_x, move_y=current.move_y,
+                )
+                if shown != current:  # skip pure placement changes (drags)
+                    self.adjustments_panel.set_values(current)
+
+    # ------------------------------------------------------------ solo / tools
+
+    def _on_solo_changed(self, entry_id: Optional[int]) -> None:
+        self.strip.set_solo_id(entry_id)
+        entry = None if entry_id is None else self.state.entry(entry_id)
+        self.canvas.set_solo_label(None if entry is None else entry.path.name)
+
+    def _on_tool_toggled(self, on: bool) -> None:
+        """Move / Crop tool on = full canvas + mouse tools; off = cropped
+        result.  Turning it off while cropping cancels the crop edit."""
+        if not on:
+            self._cancel_crop()
+        self.canvas.set_tool_enabled(on)
+        self.canvas.set_applied_crop(self.state.crop)
+        self.preview.set_show_full_canvas(on)
+        if on:
+            self._hint(
+                "Move / Crop: drag to move the selected image; "
+                "double-click the canvas to crop."
+            )
+
+    def _hint(self, text: str) -> None:
+        self.statusBar().showMessage(text, 5000)
+
+    def _on_move_started(self) -> None:
+        entry_id = self.strip.current_entry_id()
+        entry = None if entry_id is None else self.state.entry(entry_id)
+        if entry is None:
+            self._move_base = None
+            self._hint("Select an image in the list to move it.")
+            return
+        self._move_base = (
+            entry_id, entry.adjustments.move_x, entry.adjustments.move_y
+        )
+
+    def _on_move_dragged(self, dx: float, dy: float) -> None:
+        if self._move_base is None:
+            return
+        entry_id, base_x, base_y = self._move_base
+        self.state.set_placement(
+            entry_id,
+            min(max(base_x + dx, -1.0), 1.0),
+            min(max(base_y + dy, -1.0), 1.0),
+        )
+
+    def _on_move_finished(self) -> None:
+        self._move_base = None  # the layer stays anchored where it was dropped
+
+    def _on_crop_changed(self) -> None:
+        self.canvas.set_applied_crop(self.state.crop)
+        self.reset_crop_button.setVisible(self.state.crop is not None)
+
+    def _on_crop_mode_changed(self, on: bool) -> None:
+        self.crop_bar.setVisible(on)
+        self.reset_crop_button.setVisible(self.state.crop is not None)
+        for shortcut in self._crop_shortcuts:
+            shortcut.setEnabled(on)
+        if on:
+            self._hint("Crop: drag the handles or the box; Enter = Apply, "
+                       "Esc = Cancel.")
+
+    def _apply_crop(self) -> None:
+        crop = self.canvas.crop_rect()
+        if crop is None:
+            return
+        self.state.set_crop(None if canvas_tools.is_full_crop(crop) else crop)
+        self.canvas.exit_crop_mode()
+
+    def _cancel_crop(self) -> None:
+        self.canvas.exit_crop_mode()
+
+    def _reset_crop(self) -> None:
+        self.state.set_crop(None)
+        self.canvas.exit_crop_mode()
 
     # ---------------------------------------------------------------- preview I/O
 
-    def _on_preview_ready(self, composite: np.ndarray, histogram: np.ndarray) -> None:
-        self.canvas.set_composite(composite)
+    def _on_preview_ready(
+        self, composite: np.ndarray, histogram: np.ndarray, full_canvas: bool
+    ) -> None:
+        self.canvas.set_composite(composite, full_canvas)
         self.histogram.set_data(histogram)
 
     def _on_preview_cleared(self, message: str) -> None:
@@ -326,6 +487,7 @@ class MainWindow(QMainWindow):
             params=self.state.params,
             output_format=self.state.output_format,
             images=[(e.path, e.adjustments) for e in self.state.entries],
+            crop=self.state.crop,
         )
 
     def load_preset_from(self, path: Path) -> AddReport:
@@ -341,7 +503,8 @@ class MainWindow(QMainWindow):
             )
         keep = [(p, a) for p, a in data["images"] if p.exists()]
         return self.state.restore(
-            data["mode"], data["params"], data["output_format"], keep
+            data["mode"], data["params"], data["output_format"], keep,
+            crop=data["crop"],
         )
 
     def _save_preset_dialog(self) -> None:
@@ -431,6 +594,7 @@ class MainWindow(QMainWindow):
             adjustments=[e.adjustments for e in entries],
             out_path=Path(out_path),
             out_format=out_format,
+            crop=self.state.crop,
         )
         thread = QThread(self)
         thread.setObjectName("blendstack-export")

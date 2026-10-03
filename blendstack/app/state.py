@@ -11,6 +11,16 @@ every change so the UI and the preview controller can react:
   that image's adjusted proxy).
 * :attr:`DocumentState.blend_changed`       — mode or a global parameter
   changed (only the fold needs re-running).
+* :attr:`DocumentState.solo_changed`        — the soloed image changed
+  (``entry_id`` or ``None``).  Solo is transient view state: it is never
+  persisted in presets and is cleared when its image goes away.
+* :attr:`DocumentState.crop_changed`        — the canvas crop changed.  The
+  crop is ``None`` or ``(x0, y0, x1, y1)`` fractions of the FULL canvas and
+  is part of the document (presets, export).
+
+Layer placement (move) lives in each entry's
+:class:`~blendstack.core.adjustments.Adjustments` (``move_x`` / ``move_y``,
+fractions of the canvas) and is edited through :meth:`set_placement`.
 
 On add, each image immediately gets a **proxy** downscaled to
 ≤ :data:`PROXY_LONG_EDGE` px on the long edge (brief §5 live preview),
@@ -21,7 +31,7 @@ released — exports re-read the files (``engine.blend_files`` streams).
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -88,6 +98,8 @@ class DocumentState(QObject):
     images_changed = Signal()
     adjustments_changed = Signal(int)  # entry_id
     blend_changed = Signal()
+    solo_changed = Signal(object)  # entry_id (int) or None
+    crop_changed = Signal()
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -95,6 +107,8 @@ class DocumentState(QObject):
         self._mode: str = engine.mode_names()[0]
         self._params: dict[str, Any] = engine.get_mode(self._mode).default_params()
         self.output_format: str = "tiff"  # part of preset "output settings"
+        self._solo_id: Optional[int] = None
+        self._crop: Optional[tuple[float, float, float, float]] = None
 
     # -- read access --------------------------------------------------------
 
@@ -110,6 +124,17 @@ class DocumentState(QObject):
     @property
     def params(self) -> dict[str, Any]:
         return dict(self._params)
+
+    @property
+    def solo_id(self) -> Optional[int]:
+        """Entry id currently soloed in the preview, or ``None``."""
+        return self._solo_id
+
+    @property
+    def crop(self) -> Optional[tuple[float, float, float, float]]:
+        """Canvas crop as ``(x0, y0, x1, y1)`` fractions of the full canvas,
+        or ``None`` (no crop)."""
+        return self._crop
 
     def entry(self, entry_id: int) -> Optional[ImageEntry]:
         for e in self._entries:
@@ -177,7 +202,12 @@ class DocumentState(QObject):
         kept = [e for e in self._entries if e.entry_id not in doomed]
         if len(kept) != len(self._entries):
             self._entries = kept
+            solo_lost = self._solo_id is not None and self._solo_id in doomed
+            if solo_lost:
+                self._solo_id = None
             self.images_changed.emit()
+            if solo_lost:
+                self.solo_changed.emit(None)
 
     def reorder(self, entry_ids: Sequence[int]) -> None:
         """Reorder to match ``entry_ids`` (must be a permutation)."""
@@ -190,9 +220,45 @@ class DocumentState(QObject):
             self.images_changed.emit()
 
     def clear(self) -> None:
-        if self._entries:
-            self._entries = []
+        """Remove every image and drop the crop and solo state."""
+        had_solo = self._solo_id is not None
+        had_crop = self._crop is not None
+        self._solo_id = None
+        self._crop = None
+        had_images = bool(self._entries)
+        self._entries = []
+        if had_images:
             self.images_changed.emit()
+        if had_solo:
+            self.solo_changed.emit(None)
+        if had_crop:
+            self.crop_changed.emit()
+
+    # -- solo (transient view state) --------------------------------------------
+
+    def set_solo(self, entry_id: Optional[int]) -> None:
+        """Solo one image in the preview (``None`` un-solos).  Unknown ids
+        are ignored."""
+        if entry_id is not None and self.entry(entry_id) is None:
+            return
+        if entry_id != self._solo_id:
+            self._solo_id = entry_id
+            self.solo_changed.emit(entry_id)
+
+    # -- canvas crop ----------------------------------------------------------------
+
+    def set_crop(self, crop: Optional[Sequence[float]]) -> None:
+        """Set (or clear with ``None``) the canvas crop, as ``(x0, y0, x1,
+        y1)`` fractions of the full canvas.  ``ValueError`` if invalid."""
+        if crop is None:
+            new: Optional[tuple[float, float, float, float]] = None
+        else:
+            engine.crop_box_px(crop, 1000, 1000)  # validates (raises ValueError)
+            x0, y0, x1, y1 = (float(v) for v in crop)
+            new = (x0, y0, x1, y1)
+        if new != self._crop:
+            self._crop = new
+            self.crop_changed.emit()
 
     # -- per-image settings ---------------------------------------------------
 
@@ -201,6 +267,22 @@ class DocumentState(QObject):
         if entry is not None and entry.adjustments != adjustments:
             entry.adjustments = adjustments
             self.adjustments_changed.emit(entry_id)
+
+    def set_placement(self, entry_id: int, move_x: float, move_y: float) -> None:
+        """Place one layer on the canvas (fractions of canvas width/height,
+        +x right, +y down).  Only the placement changes; emits
+        :attr:`adjustments_changed` like any per-image edit."""
+        entry = self.entry(entry_id)
+        if entry is not None:
+            self.set_adjustments(
+                entry_id,
+                replace(entry.adjustments,
+                        move_x=float(move_x), move_y=float(move_y)),
+            )
+
+    def reset_placement(self, entry_id: int) -> None:
+        """Put one layer back to its centred default position."""
+        self.set_placement(entry_id, 0.0, 0.0)
 
     # -- global blend settings -------------------------------------------------
 
@@ -229,14 +311,20 @@ class DocumentState(QObject):
         params: dict[str, Any],
         output_format: str,
         images: Sequence[tuple[Path, Adjustments]],
+        crop: Optional[Sequence[float]] = None,
     ) -> AddReport:
-        """Replace the whole document from preset data.
+        """Replace the whole document from preset data (incl. the crop).
 
         Missing/unreadable files come back in the report; everything else
         loads (brief §5: load what it can).
         """
         engine.get_mode(mode)  # validate before touching state
+        if crop is not None:
+            engine.crop_box_px(crop, 1000, 1000)  # validate before mutating
+        had_solo = self._solo_id is not None
         self._entries = []
+        self._solo_id = None
+        self._crop = None if crop is None else tuple(float(v) for v in crop)
         self._mode = mode
         self._params = engine.get_mode(mode).resolve_params(params)
         self.output_format = output_format
@@ -247,4 +335,7 @@ class DocumentState(QObject):
         )
         self.blend_changed.emit()
         self.images_changed.emit()
+        self.crop_changed.emit()
+        if had_solo:
+            self.solo_changed.emit(None)
         return report

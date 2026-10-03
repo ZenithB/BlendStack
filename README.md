@@ -62,6 +62,16 @@ python -m blendstack.app
 
 Drag images in (TIFF, JPEG, PNG, GIF, BMP, WebP, RAW), reorder the strip (top = base image), tweak per-image adjustments and blend controls, watch the live preview and composite histogram, and export 16-bit TIFF/PNG or 8-bit JPEG.
 
+Per-image tools in the right pane:
+
+- **Adjustments** — exposure, contrast, saturation, sharpen (radius up to 20 px), **noise removal** (an edge-preserving filter to offset sharpening noise), and opacity.
+- **Curves** — a graphical levels curve with independent RGB (master), R, G and B channels. Click to add a point, drag to move it, double-click or right-click to remove it.
+- **Processing order** — drag the stages (exposure, contrast, curves, saturation, noise removal, sharpen) into any order, per image.
+
+On the left, each image has a **Solo** button (**S**) that shows just that image with its own adjustments applied, so you can judge your edits in isolation.
+
+**Move / Crop** (toolbar, or `M`): with the tool on, click-and-drag in the preview to move the selected layer around the canvas; releasing anchors it. Where a moved layer no longer covers the canvas it is *transparent* — it simply doesn't take part in the blend there (Average averages only the layers that cover each pixel). Double-click the preview to crop the **whole canvas**, then press Apply (Enter) or Cancel (Esc). Layer positions and the crop are saved in presets and honoured on export.
+
 ## GIMP plugin
 
 Copy `gimp_plugin/blendstack-blend/` into your GIMP 3 plug-ins directory

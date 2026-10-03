@@ -41,6 +41,17 @@ QSlider::handle:horizontal:hover {{
 """
 
 
+class _WheelGuardSlider(QSlider):
+    """QSlider that only reacts to the mouse wheel once it has keyboard focus,
+    so scrolling the (long) controls panel never nudges a slider by accident."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class SliderRow(QWidget):
     """Label + value readout above a horizontal slider."""
 
@@ -61,7 +72,8 @@ class SliderRow(QWidget):
         self._decimals = decimals
         self._suffix = suffix
 
-        self.slider = QSlider(Qt.Horizontal, self)
+        self.slider = _WheelGuardSlider(Qt.Horizontal, self)
+        self.slider.setFocusPolicy(Qt.StrongFocus)
         self.slider.setRange(minimum, maximum)
         self.slider.setStyleSheet(_SLIDER_QSS)
         self._name_label = QLabel(label, self)
@@ -85,6 +97,11 @@ class SliderRow(QWidget):
 
     def value(self) -> float:
         return self.slider.value() * self._scale
+
+    def matches(self, value: float) -> bool:
+        """True if ``value`` lands on the slider's current step (i.e. the
+        slider would show it unchanged)."""
+        return self.slider.value() == round(value / self._scale)
 
     def set_value(self, value: float) -> None:
         """Move the slider without emitting :attr:`valueChanged`."""
