@@ -77,7 +77,10 @@ class BlendMode(abc.ABC):
         ``accumulator`` (so ``incoming`` is image number ``count + 1``).
         Most modes ignore it; running-aggregate modes such as Average need
         it to weight the incoming image correctly (e.g. a true mean must
-        weight the new frame by ``1 / (count + 1)``).
+        weight the new frame by ``1 / (count + 1)``).  ``count`` is an int
+        in the plain fold, or a float32 ``(H, W, 1)`` array of per-pixel
+        counts when the engine tracks layer coverage (moved layers); modes
+        that use it must accept both.
         """
 
     @classmethod

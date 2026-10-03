@@ -17,6 +17,10 @@ by ``1 / (count + 1)`` to keep a true running mean:
 which is order-independent (the mean does not depend on frame order). With
 per-image opacity below 100 % the fold's opacity lerp turns it into a
 weighted mean, which is a reasonable, documented departure.
+
+``count`` may be an int (every pixel holds the same number of frames) or a
+float32 ``(H, W, 1)`` array (the coverage-aware fold, where moved layers
+leave gaps and each pixel is the mean of only the layers that cover it).
 """
 
 from __future__ import annotations
@@ -44,6 +48,12 @@ class Average(BlendMode):
         params: Mapping[str, Any] | None = None,
         count: int = 1,
     ) -> np.ndarray:
-        n = max(int(count), 1)
-        w = np.float32(1.0 / (n + 1))
+        if isinstance(count, np.ndarray):
+            # Per-pixel counts (coverage-aware fold): a (H, W, 1) array of how
+            # many layers each pixel of the accumulator already holds.
+            n = np.maximum(count, 1).astype(np.float64)
+            w = (1.0 / (n + 1.0)).astype(np.float32)
+        else:
+            n = max(int(count), 1)
+            w = np.float32(1.0 / (n + 1))
         return accumulator + (incoming - accumulator) * w
