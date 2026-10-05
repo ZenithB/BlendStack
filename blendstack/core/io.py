@@ -35,7 +35,7 @@ import zlib
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
@@ -47,6 +47,7 @@ __all__ = [
     "OUTPUT_FORMATS",
     "load_image",
     "probe_size",
+    "check_sources",
     "save_image",
     "default_filename",
 ]
@@ -96,12 +97,71 @@ def load_image(path: PathLike) -> np.ndarray:
     return _load_pil(path)
 
 
+def _clean_library_message(exc: BaseException) -> str:
+    """Readable text for a library error.
+
+    rawpy/LibRaw report errors as *bytes*, so ``str(exc)`` comes out as
+    ``"b'Input/output error'"`` — decode that to plain text.
+    """
+    arg = exc.args[0] if exc.args else ""
+    if isinstance(arg, bytes):
+        return arg.decode("utf-8", "replace")
+    text = str(exc)
+    if text.startswith(("b'", 'b"')) and text.endswith(("'", '"')):
+        text = text[2:-1]
+    return text or type(exc).__name__
+
+
+_CONNECTED_HINT = (
+    "If the files are on an external drive or network volume, check that it "
+    "is still connected, then try again."
+)
+
+
+def check_sources(paths: Sequence[PathLike]) -> None:
+    """Fail fast, with a clear message, if any source file can't be read.
+
+    Checked up front so a disconnected drive or moved file is reported by
+    name *before* any slow full-resolution work starts (and instead of an
+    opaque library error such as ``b'Input/output error'``).
+    """
+    missing: list[Path] = []
+    unreadable: list[Path] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            missing.append(path)
+            continue
+        try:
+            with open(path, "rb") as fh:
+                fh.read(1)
+        except OSError:
+            unreadable.append(path)
+    if not (missing or unreadable):
+        return
+    lines = []
+    if missing:
+        lines.append("Source file(s) not found:")
+        lines += [f"  {p}" for p in missing]
+    if unreadable:
+        lines.append("Source file(s) could not be read:")
+        lines += [f"  {p}" for p in unreadable]
+    lines.append(_CONNECTED_HINT)
+    raise FileNotFoundError("\n".join(lines))
+
+
 def _load_raw(path: Path) -> np.ndarray:
     """RAW via rawpy/LibRaw with default postprocessing (brief §2)."""
     import rawpy  # lazy: keeps core importable where LibRaw is absent
 
-    with rawpy.imread(str(path)) as raw:
-        rgb = raw.postprocess()  # LibRaw defaults: demosaic, WB, tone, 8-bit
+    try:
+        with rawpy.imread(str(path)) as raw:
+            rgb = raw.postprocess()  # LibRaw defaults: demosaic, WB, tone, 8-bit
+    except rawpy.LibRawError as exc:
+        raise OSError(
+            f"Could not read RAW file '{path.name}': "
+            f"{_clean_library_message(exc)}. {_CONNECTED_HINT}"
+        ) from exc
     return _normalise_array(rgb)
 
 
@@ -186,11 +246,17 @@ def probe_size(path: PathLike) -> Tuple[int, int]:
     if path.suffix.lower() in RAW_EXTENSIONS:
         import rawpy  # lazy
 
-        with rawpy.imread(str(path)) as raw:
-            sizes = raw.sizes
-            width, height = sizes.width, sizes.height
-            if sizes.flip in (5, 6):  # LibRaw applies 90° rotation on output
-                width, height = height, width
+        try:
+            with rawpy.imread(str(path)) as raw:
+                sizes = raw.sizes
+                width, height = sizes.width, sizes.height
+                if sizes.flip in (5, 6):  # LibRaw applies 90° rotation on output
+                    width, height = height, width
+        except rawpy.LibRawError as exc:
+            raise OSError(
+                f"Could not read RAW file '{path.name}': "
+                f"{_clean_library_message(exc)}. {_CONNECTED_HINT}"
+            ) from exc
         return width, height
     with Image.open(path) as im:
         return im.size

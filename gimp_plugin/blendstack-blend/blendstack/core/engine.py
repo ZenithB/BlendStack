@@ -389,6 +389,9 @@ def blend_files(
     adjs = _resolve_adjustment_list(adjustments, len(paths))
     if crop is not None:
         _validate_crop(crop)
+    # Fail fast and by name if a source file has gone (e.g. an external drive
+    # was disconnected since the images were added) — before any slow work.
+    bs_io.check_sources(paths)
 
     # Pass 1: cheap size probe to pick target dims (smallest by area, §4.3).
     sizes = [bs_io.probe_size(p) for p in paths]
