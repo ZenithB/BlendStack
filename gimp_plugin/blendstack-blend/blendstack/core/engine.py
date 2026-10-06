@@ -353,8 +353,11 @@ def blend_arrays(
         _validate_crop(crop)
     arrays = [_as_float_rgb(im) for im in images]
     target = geometry.target_dimensions([(a.shape[1], a.shape[0]) for a in arrays])
+    _check_active(adjs)
     fold = BlendFold(mode, params)
     for array, adj in zip(arrays, adjs):
+        if adj.mute:  # muted: still sized the canvas above, but not blended
+            continue
         placed, mask = _prepare_layer(geometry.cover_scale(array, target), adj, target)
         fold.push(placed, opacity=adj.opacity, mask=mask)
     return apply_crop(fold.result(), crop)
@@ -398,8 +401,11 @@ def blend_files(
     target = geometry.target_dimensions(sizes)
 
     # Pass 2: stream the fold.
+    _check_active(adjs)
     fold = BlendFold(mode, params)
     for path, adj in zip(paths, adjs):
+        if adj.mute:  # muted: sized the canvas above; never loaded or blended
+            continue
         image = bs_io.load_image(path)
         placed, mask = _prepare_layer(geometry.cover_scale(image, target), adj, target)
         del image
@@ -423,6 +429,16 @@ def _check_count(n: int) -> None:
     if not MIN_IMAGES <= n <= MAX_IMAGES:
         raise ValueError(
             f"A blend takes {MIN_IMAGES}–{MAX_IMAGES} images, got {n}"
+        )
+
+
+def _check_active(adjs: Sequence[Adjustments]) -> None:
+    """A blend needs at least MIN_IMAGES images that are not muted."""
+    active = sum(1 for a in adjs if not a.mute)
+    if active < MIN_IMAGES:
+        raise ValueError(
+            f"A blend needs at least {MIN_IMAGES} un-muted images, got {active} "
+            f"({len(adjs) - active} muted)"
         )
 
 

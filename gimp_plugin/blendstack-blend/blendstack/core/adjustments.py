@@ -164,6 +164,8 @@ class Adjustments:
     order: tuple = DEFAULT_ORDER  # processing order of the per-image stages
     move_x: float = 0.0          # placement, fraction of canvas width (+right)
     move_y: float = 0.0          # placement, fraction of canvas height (+down)
+    mute: bool = False           # excluded from the blend (still sizes the canvas);
+                                 # like opacity/placement it is NOT an image adjustment
 
     def __post_init__(self) -> None:
         # Normalise (and validate) curves and order so JSON lists / any
@@ -199,6 +201,8 @@ class Adjustments:
         for k, v in mapping.items():
             if k in _CURVE_FIELDS or k == "order":
                 kwargs[k] = v  # normalised/validated by __post_init__
+            elif k == "mute":
+                kwargs[k] = bool(v)
             else:
                 kwargs[k] = float(v)
         return cls(**kwargs)
@@ -219,7 +223,7 @@ class Adjustments:
 
     def adjust_key(self) -> tuple:
         """Hashable key of everything that affects the per-image adjusted
-        pixels.  Excludes ``opacity``, ``move_x`` and ``move_y`` (fold /
+        pixels.  Excludes ``opacity``, ``mute``, ``move_x`` and ``move_y`` (fold /
         placement concerns) so it is a valid cache key for adjusted images."""
         return (
             self.exposure, self.contrast, self.saturation, self.denoise,
