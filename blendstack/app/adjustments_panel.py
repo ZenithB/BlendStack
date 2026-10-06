@@ -1,7 +1,8 @@
 """Per-image adjustments panel (project brief §5 layout, §4.1 definitions).
 
 Edits the :class:`~blendstack.core.adjustments.Adjustments` of the image
-currently selected in the strip: exposure -3...+3 EV, contrast / saturation
+currently selected in the strip, as one wide horizontal "rack" block with
+three titled sections (IMAGE knobs | CURVES | ORDER): exposure -3...+3 EV, contrast / saturation
 -100...+100, tone curves (master + R/G/B), sharpen radius 0.5-20 px, sharpen
 amount 0-200 %, noise removal 0-100 %, opacity 0-100 %, the per-image
 processing order, plus a Reset button.  Emits :attr:`adjustments_edited`
@@ -9,7 +10,7 @@ with a fresh frozen ``Adjustments`` on every user change; the main window
 routes it to the document state for the selected entry.
 
 The panel does not own every field of ``Adjustments`` (layer placement
-``move_x`` / ``move_y`` belongs to the canvas tool).  It therefore remembers
+``move_x`` / ``move_y`` belongs to the canvas tool, ``mute`` to the strip).  It therefore remembers
 the last ``Adjustments`` it was given / emitted and builds every result with
 :func:`dataclasses.replace` on it, so fields it does not edit are preserved.
 """
@@ -19,11 +20,13 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
-    QGroupBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
     QPushButton,
-    QToolButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -31,81 +34,95 @@ from PySide6.QtWidgets import (
 from blendstack.core.adjustments import Adjustments, IDENTITY_CURVE
 
 from .curve_editor import CurveEditor
+from .knob import (
+    Knob,
+    ghost_button_stylesheet,
+    make_section_title,
+    make_vrule,
+    refresh_layouts,
+)
 from .order_panel import OrderPanel
-from .slider_row import SliderRow
 
 __all__ = ["AdjustmentsPanel"]
 
 
-class _Section(QWidget):
-    """A header button (with expand/collapse arrow) above a content widget."""
-
-    def __init__(self, title: str, content: QWidget, expanded: bool = True,
-                 parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.content = content
-        self.toggle = QToolButton(self)
-        self.toggle.setText(title)
-        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.toggle.setCheckable(True)
-        self.toggle.setAutoRaise(True)
-        self.toggle.setStyleSheet("QToolButton { font-weight: bold; border: none; }")
-        self.toggle.toggled.connect(self._on_toggled)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        layout.addWidget(self.toggle, 0, Qt.AlignLeft)
-        layout.addWidget(content)
-        self.toggle.setChecked(expanded)
-        self._on_toggled(expanded)
-
-    def _on_toggled(self, expanded: bool) -> None:
-        self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
-        self.content.setVisible(expanded)
+def _section(title: str, content: QWidget, parent: QWidget) -> QWidget:
+    """A titled column of the rack: gold caption above ``content``."""
+    box = QWidget(parent)
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+    lay.addWidget(make_section_title(title, box), 0, Qt.AlignLeft)
+    lay.addWidget(content)
+    lay.addStretch(1)
+    return box
 
 
 def _curve_is_identity(points) -> bool:
     return tuple(tuple(p) for p in points) == tuple(tuple(p) for p in IDENTITY_CURVE)
 
 
-class AdjustmentsPanel(QGroupBox):
-    """Sliders, curves and processing order for the selected image."""
+class AdjustmentsPanel(QFrame):
+    """Knobs, curves and processing order for the selected image, laid out as
+    one wide rack block: IMAGE | CURVES | ORDER."""
 
     #: Emitted with the new Adjustments after any user edit.
     adjustments_edited = Signal(object)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Image adjustments", parent)
-        # Slider integer ranges map onto brief §4.1 UI ranges via `scale`.
-        self.exposure_row = SliderRow("Exposure", -300, 300, scale=0.01,
-                                      decimals=2, suffix=" EV")
-        self.contrast_row = SliderRow("Contrast", -100, 100)
-        self.saturation_row = SliderRow("Saturation", -100, 100)
-        self.radius_row = SliderRow("Sharpen radius", 5, 200, scale=0.1,
-                                    decimals=1, suffix=" px")
-        self.amount_row = SliderRow("Sharpen amount", 0, 200, suffix=" %")
-        self.denoise_row = SliderRow("Noise removal", 0, 100, suffix=" %")
-        self.opacity_row = SliderRow("Opacity", 0, 100, suffix=" %")
+        super().__init__(parent)
+        self.setProperty("panel", True)
+        # Knob integer ranges map onto brief §4.1 UI ranges via `scale`.
+        self.exposure_row = Knob("EXPOSURE", -300, 300, scale=0.01,
+                                 decimals=2, suffix=" EV", default=0.0)
+        self.contrast_row = Knob("CONTRAST", -100, 100, default=0.0)
+        self.saturation_row = Knob("SATURATION", -100, 100, default=0.0)
+        self.opacity_row = Knob("OPACITY", 0, 100, suffix=" %", default=100.0)
+        self.radius_row = Knob("SHARPEN RADIUS", 5, 200, scale=0.1,
+                               decimals=1, suffix=" px", default=1.0)
+        self.amount_row = Knob("SHARPEN AMOUNT", 0, 200, suffix=" %", default=0.0)
+        self.denoise_row = Knob("NOISE REMOVAL", 0, 100, suffix=" %", default=0.0)
         self.curve_editor = CurveEditor(self)
         self.order_panel = OrderPanel(self)
-        self.curves_section = _Section("Curves", self.curve_editor, True, self)
-        self.order_section = _Section("Routing", self.order_panel, True, self)
-        self.reset_button = QPushButton("Reset", self)
+        self.reset_button = QPushButton("RESET", self)
+        self.reset_button.setProperty("variant", "ghost")
+        self.reset_button.setStyleSheet(ghost_button_stylesheet())
+        self.reset_button.setFixedHeight(22)
+        self.reset_button.setCursor(Qt.PointingHandCursor)
+        self.reset_button.setToolTip(
+            "Reset exposure, contrast, saturation, opacity, sharpen, noise removal, "
+            "curves and order (placement and mute are kept)"
+        )
 
         self._base = Adjustments()
         self._syncing = False
+        self._compact = False
+        self._auto_compact = True
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.exposure_row)
-        layout.addWidget(self.contrast_row)
-        layout.addWidget(self.saturation_row)
-        layout.addWidget(self.curves_section)
-        layout.addWidget(self.radius_row)
-        layout.addWidget(self.amount_row)
-        layout.addWidget(self.denoise_row)
-        layout.addWidget(self.opacity_row)
-        layout.addWidget(self.order_section)
-        layout.addWidget(self.reset_button)
+        # IMAGE section: 4 x 2 grid of knobs, RESET in the last cell.
+        image = QWidget(self)
+        grid = QGridLayout(image)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(2)
+        grid.setVerticalSpacing(4)
+        cells = (
+            self.exposure_row, self.contrast_row, self.saturation_row, self.opacity_row,
+            self.radius_row, self.amount_row, self.denoise_row,
+        )
+        for i, knob in enumerate(cells):
+            grid.addWidget(knob, i // 4, i % 4, Qt.AlignHCenter | Qt.AlignTop)
+        grid.addWidget(self.reset_button, 1, 3, Qt.AlignCenter)
+        self.image_grid = image
+        self._grid = grid
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(10)
+        layout.addWidget(_section("Image", image, self), 0)
+        layout.addWidget(make_vrule(self))
+        layout.addWidget(_section("Curves", self.curve_editor, self), 0)
+        layout.addWidget(make_vrule(self))
+        layout.addWidget(_section("Order", self.order_panel, self), 0)
 
         for row in self._rows():
             row.valueChanged.connect(self._emit_edited)
@@ -113,10 +130,58 @@ class AdjustmentsPanel(QGroupBox):
         self.order_panel.order_changed.connect(self._emit_edited)
         self.reset_button.clicked.connect(self.reset)
 
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+
+        # Measure the normal and the compact layout once so sizeHint /
+        # minimumSizeHint are stable and compact mode can switch on width.
+        self._compact_hint = QSize()
+        self._normal_hint = QSize()
+        self._measure_hints()
+
         self.set_values(Adjustments())
         self.setEnabled(False)  # until an image is selected
 
-    def _rows(self) -> tuple[SliderRow, ...]:
+    # ----------------------------------------------------------------- sizing
+
+    def _measure_hints(self) -> None:
+        self._apply_compact(True)
+        self._compact_hint = self.layout().sizeHint()
+        self._apply_compact(False)
+        self._normal_hint = self.layout().sizeHint()
+
+    def _apply_compact(self, compact: bool) -> None:
+        self._compact = bool(compact)
+        size = Knob.COMPACT if compact else Knob.NORMAL
+        for knob in self._rows():
+            knob.set_dial_size(size)
+        self.curve_editor.set_compact(compact)
+        refresh_layouts(self)
+
+    def set_compact(self, compact: bool, auto: bool = False) -> None:
+        """Switch to the compact rack (smaller dials / plot).  With
+        ``auto=False`` (default) this also turns off width-driven switching."""
+        if not auto:
+            self._auto_compact = False
+        if bool(compact) != self._compact:
+            self._apply_compact(compact)
+
+    def is_compact(self) -> bool:
+        return self._compact
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self._normal_hint
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self._compact_hint
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._auto_compact:
+            want = self.width() < self._normal_hint.width()
+            if want != self._compact:
+                self._apply_compact(want)
+
+    def _rows(self) -> tuple[Knob, ...]:
         return (
             self.exposure_row,
             self.contrast_row,
@@ -128,8 +193,8 @@ class AdjustmentsPanel(QGroupBox):
         )
 
     @staticmethod
-    def _read(row: SliderRow, base_value: float) -> float:
-        """Slider value, but keep ``base_value`` untouched while the slider
+    def _read(row: Knob, base_value: float) -> float:
+        """Knob value, but keep ``base_value`` untouched while the knob
         still sits on its step (so un-edited fields never get re-quantised)."""
         return base_value if row.matches(base_value) else row.value()
 
@@ -178,9 +243,10 @@ class AdjustmentsPanel(QGroupBox):
     def reset(self) -> None:
         """Reset button (brief §5): every field the panel edits back to its
         default (identity curves, default order, opacity 100), keeping the
-        layer placement; then emit."""
+        layer placement and the mute flag; then emit."""
         keep = self._base
-        self.set_values(replace(Adjustments(), move_x=keep.move_x, move_y=keep.move_y))
+        self.set_values(replace(Adjustments(), move_x=keep.move_x, move_y=keep.move_y,
+                                mute=keep.mute))
         self._emit_edited()
 
     def _update_active(self, a: Adjustments) -> None:

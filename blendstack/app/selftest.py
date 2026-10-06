@@ -28,6 +28,16 @@ Exercises, against a real (offscreen) MainWindow:
    round-trip of crop / move / denoise / curve / order (and an old preset),
    small window minimum size.
 
+10. per-image Mute: via state and via a simulated click on the strip's M
+   button (selection / order untouched, no drag), muted image absent from the
+   preview (== ``engine.blend_arrays``), canvas size unchanged when the
+   smallest image is muted, mute/un-mute re-runs only the fold (no
+   re-adjust), <2 un-muted -> "Un-mute" placeholder + friendly export
+   refusal, solo overrides mute, Shift+M / M keys, preset round-trip, and
+   export (with a muted image) equals the preview;
+11. the one-screen rack layout at 1280x800 and 1200x720: no scroll area, rack
+   <= 260 px, canvas >= 380 px, nothing clipped, window minimum <= 1200x700.
+
 Exits non-zero if any check fails.
 """
 
@@ -46,13 +56,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np  # noqa: E402
 from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
 from PySide6.QtGui import QMouseEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox, QScrollArea, QWidget  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 
 from blendstack.core import engine, geometry  # noqa: E402
 from blendstack.core import io as bs_io  # noqa: E402
 from blendstack.core.adjustments import DEFAULT_ORDER, Adjustments  # noqa: E402
+from blendstack.app import theme  # noqa: E402
 from blendstack.app.main_window import MainWindow  # noqa: E402
+from blendstack.app.preview import MUTE_PLACEHOLDER_TEXT, PLACEHOLDER_TEXT  # noqa: E402
 
 _RESULTS: list[tuple[str, bool, str]] = []
 
@@ -172,11 +184,14 @@ def check_solo(window: MainWindow, paths) -> None:
           canvas.solo_label() == "SOLO — two.jpg",
           f"label={canvas.solo_label()}")
     img = canvas.grab().toImage()
-    rect = canvas.display_rect()
-    px = img.pixelColor(int(rect.left()) + 11, int(rect.top()) + 22)
-    check("solo banner is painted on the canvas",
-          px.red() > 200 and 120 < px.green() < 220 and px.blue() < 80,
-          f"pixel={px.getRgb()}")
+    pill = canvas.solo_banner_rect()
+    gold = theme.color(theme.GOLD[0])
+    px = img.pixelColor(int(pill.left()) + 10, int(pill.center().y()))
+    check("solo banner is a gold pill painted on the canvas",
+          not pill.isEmpty()
+          and abs(px.red() - gold.red()) < 12 and abs(px.green() - gold.green()) < 12
+          and abs(px.blue() - gold.blue()) < 12,
+          f"pill={pill} pixel={px.getRgb()}")
     check("solo frame is the single image (no adjustments)",
           np.allclose(canvas.composite(),
                       expected_single(entries[1], entries), atol=1e-6)
@@ -300,12 +315,12 @@ def check_move(window: MainWindow, paths) -> None:
           and np.allclose(canvas.composite(), frame0, atol=1e-6))
     # panel edits cannot clobber the placement
     state.set_placement(ids[0], 0.2, 0.1)
-    window.adjustments_panel.exposure_row.slider.setValue(50)
+    window.adjustments_panel.exposure_row.set_value_from_user(0.5)
     a = state.entry(ids[0]).adjustments
     check("panel edit preserves placement",
           a.move_x == 0.2 and a.move_y == 0.1 and a.exposure == 0.5,
           f"{a.move_x} {a.move_y} {a.exposure}")
-    window.adjustments_panel.exposure_row.slider.setValue(0)
+    window.adjustments_panel.exposure_row.set_value_from_user(0.0)
     state.reset_placement(ids[0])
     settle(window)
 
@@ -447,6 +462,10 @@ def check_crop(window: MainWindow, paths) -> None:
     QTest.mouseDClick(canvas, Qt.LeftButton, pos=center.toPoint())
     check("double-click enters crop mode",
           canvas.crop_mode() and window.crop_bar.isVisible())
+    # The crop bar takes a slice of the canvas column, so the (height-bound)
+    # frame is re-fitted: measure the display rectangle again.
+    QTest.qWait(60)
+    rect = canvas.display_rect()
     check("crop bar: Reset hidden without a crop",
           not window.reset_crop_button.isVisible())
     c = canvas.crop_rect()
@@ -457,7 +476,7 @@ def check_crop(window: MainWindow, paths) -> None:
           state.entry(ids[0]).adjustments.move_x == 0.0)
     hint = window.minimumSizeHint()
     check("crop bar keeps the window minimum small",
-          hint.width() <= 900 and hint.height() <= 450,
+          hint.width() <= 1200 and hint.height() <= 700,
           f"minimumSizeHint={hint.width()}x{hint.height()}")
 
     # drag the bottom-right handle inwards
@@ -701,13 +720,424 @@ def check_export_and_presets(window: MainWindow, paths, tmp: Path) -> None:
           window.canvas.composite().shape == (384, 512, 3))
 
     hint = window.minimumSizeHint()
-    check("window minimumSizeHint stays small (<= 900 x 450)",
-          hint.width() <= 900 and hint.height() <= 450,
+    check("window minimumSizeHint stays small (<= 1200 x 700)",
+          hint.width() <= 1200 and hint.height() <= 700,
           f"minimumSizeHint={hint.width()}x{hint.height()}")
-    check("controls scroll area and pinned histogram still present",
-          window.controls_scroll.widget() is not None
-          and window.histogram.isVisible())
+    check("histogram stays visible and there is no scroll area",
+          window.histogram.isVisible()
+          and not window.findChildren(QScrollArea))
     state.set_crop(None)
+
+
+class FrameCounter:
+    """Counts frames / placeholders delivered by the preview controller, so a
+    test can wait for a NEW result after an edit (``render_settled`` alone can
+    be momentarily true during the 80 ms debounce)."""
+
+    def __init__(self, window: MainWindow) -> None:
+        self.frames = 0
+        self.cleared = 0
+        self._preview = window.preview
+        window.preview.preview_ready.connect(self._on_frame)
+        window.preview.preview_cleared.connect(self._on_cleared)
+
+    def _on_frame(self, *_a) -> None:
+        self.frames += 1
+
+    def _on_cleared(self, *_a) -> None:
+        self.cleared += 1
+
+    def total(self) -> int:
+        return self.frames + self.cleared
+
+    def disconnect(self) -> None:
+        self._preview.preview_ready.disconnect(self._on_frame)
+        self._preview.preview_cleared.disconnect(self._on_cleared)
+
+
+def wait_result(counter: FrameCounter, before: int, timeout_ms: int = 10000) -> bool:
+    """Wait for a render result (frame or placeholder) newer than ``before``."""
+    return wait_until(lambda: counter.total() > before, timeout_ms)
+
+
+def dismiss_boxes() -> None:
+    for box in QApplication.topLevelWidgets():
+        if isinstance(box, QMessageBox):
+            box.close()
+    QTest.qWait(30)
+
+
+def expected_blend(window: MainWindow, paths, **kw) -> np.ndarray:
+    """Reference frame: the core engine on the same (un-proxied) images."""
+    arrays = [bs_io.load_image(p) for p in paths]
+    adjs = [e.adjustments for e in window.state.entries]
+    return engine.blend_arrays(arrays, adjs, window.state.mode,
+                               window.state.params, **kw)
+
+
+def check_mute(window: MainWindow, paths, tmp: Path) -> None:
+    """Section 10: per-image mute (state, strip, preview worker, export)."""
+    import imageio.v3 as iio
+
+    state, strip, canvas = window.state, window.strip, window.canvas
+    ids = reload_images(window, paths)
+    worker = window.preview.worker
+    counter = FrameCounter(window)
+    full_shape = (384, 512, 3)  # smallest image (three.tif) sizes the canvas
+
+    check("mute: nothing muted initially",
+          state.unmuted_count() == 3 and not any(strip.is_muted(r) for r in range(3)))
+    check("mute: first row is the BASE", strip.base_row() == 0)
+
+    # -- via the state; counters watch that nothing is re-adjusted -----------------
+    calls = {"n": 0}
+    real_adjust = engine.adjust_image
+
+    def counting(image, adjustments=None):
+        calls["n"] += 1
+        return real_adjust(image, adjustments)
+
+    engine.adjust_image = counting
+    ref_calls = {"n": 0}
+
+    def reference(*a, **kw):
+        """Reference blend; its own adjust calls must not count."""
+        before = calls["n"]
+        out = expected_blend(window, paths, *a, **kw)
+        ref_calls["n"] += calls["n"] - before
+        return out
+
+    try:
+        a0, s0, c0 = worker.adjust_calls, worker.scale_calls, calls["n"]
+        n = counter.total()
+        state.set_mute(ids[2], True)  # the SMALLEST image (it defines the canvas)
+        ok = wait_result(counter, n)
+        check("mute via state: strip mirrors it",
+              ok and state.is_muted(ids[2]) and strip.is_muted(2)
+              and state.unmuted_count() == 2)
+        want = reference()
+        check("muted smallest image: canvas size unchanged (all images size it)",
+              canvas.composite().shape == full_shape and want.shape == full_shape,
+              f"shape={canvas.composite().shape}")
+        before = calls["n"]
+        sub = engine.blend_arrays([bs_io.load_image(p) for p in paths[:2]], None,
+                                  state.mode, state.params)
+        ref_calls["n"] += calls["n"] - before
+        check("…and it differs from blending only the un-muted images' canvas",
+              sub.shape != full_shape)
+        diff = float(np.abs(canvas.composite() - want).max())
+        check("muted image is absent from the preview composite (== blend_arrays)",
+              diff <= 1e-6, f"maxdiff={diff:.2e}")
+        check("strip: BASE badge unchanged when the last row is muted",
+              strip.base_row() == 0)
+        check("histogram follows the composite", window.histogram.has_data())
+
+        n = counter.total()
+        state.set_mute(ids[2], False)
+        ok = wait_result(counter, n)
+        want_all = reference()
+        diff = float(np.abs(canvas.composite() - want_all).max())
+        check("un-mute restores the full blend",
+              ok and diff <= 1e-6 and not strip.is_muted(2), f"maxdiff={diff:.2e}")
+        check("mute / un-mute re-renders only the fold (no re-adjust, no re-scale)",
+              worker.adjust_calls == a0 and calls["n"] - ref_calls["n"] == c0
+              and worker.scale_calls == s0,
+              f"worker {a0}->{worker.adjust_calls}, wrapped "
+              f"{c0}->{calls['n'] - ref_calls['n']}, "
+              f"scale {s0}->{worker.scale_calls}")
+        check("mute is not part of adjust_key",
+              Adjustments().adjust_key()
+              == dataclasses.replace(Adjustments(), mute=True).adjust_key())
+    finally:
+        engine.adjust_image = real_adjust
+
+    # -- via a simulated click on the strip's M button -------------------------------
+    sel_before = strip.current_entry_id()
+    order_before = strip.current_ids()
+    button = strip.mute_button_rect(1)
+    check("mute button rect is inside the row and left of Solo",
+          not button.isEmpty() and strip.viewport().rect().contains(button)
+          and button.right() < strip.solo_button_rect(1).left())
+    n = counter.total()
+    QTest.mouseClick(strip.viewport(), Qt.LeftButton, pos=button.center())
+    ok = wait_result(counter, n)
+    check("clicking the M button mutes that row",
+          state.is_muted(ids[1]) and strip.is_muted(1) and not state.is_muted(ids[0])
+          and not state.is_muted(ids[2]))
+    check("M click kept order, selection and solo",
+          strip.current_ids() == order_before == state.entry_ids()
+          and strip.current_entry_id() == sel_before and state.solo_id is None,
+          f"order={strip.current_ids()} sel={strip.current_entry_id()}")
+    want = expected_blend(window, paths)
+    check("click-muted image is absent from the preview",
+          ok and float(np.abs(canvas.composite() - want).max()) <= 1e-6)
+    # the row is painted dimmed with a struck-through name
+    img = strip.viewport().grab().toImage()
+    row_rect = strip.visualItemRect(strip.item(1))
+    thumb_px = img.pixelColor(row_rect.left() + 8 + 32 + 4 + 32, row_rect.center().y())
+    live_px = img.pixelColor(strip.visualItemRect(strip.item(2)).left() + 8 + 32 + 4 + 32,
+                             strip.visualItemRect(strip.item(2)).center().y())
+    check("muted row paints (dimmed thumbnail vs live row)",
+          thumb_px.lightness() < live_px.lightness() or thumb_px.getRgb() != live_px.getRgb())
+    n = counter.total()
+    QTest.mouseClick(strip.viewport(), Qt.LeftButton, pos=button.center())
+    wait_result(counter, n)
+    check("clicking M again un-mutes", not state.is_muted(ids[1]))
+    # press + drag starting on M must not start a reorder
+    mouse_event(strip.viewport(), QEvent.MouseButtonPress,
+                strip.mute_button_rect(0).center())
+    mouse_event(strip.viewport(), QEvent.MouseMove,
+                strip.mute_button_rect(2).center(), button=Qt.NoButton)
+    mouse_event(strip.viewport(), QEvent.MouseButtonRelease,
+                strip.mute_button_rect(2).center(), buttons=Qt.NoButton)
+    check("dragging from the M button does not reorder",
+          state.entry_ids() == ids and strip.current_ids() == ids)
+    state.set_mute(ids[0], False)
+    wait_until(lambda: not strip.is_muted(0))
+    wait_result(counter, counter.total())  # let any pending render land
+    settle(window)
+
+    # -- fewer than 2 un-muted: placeholder + friendly refusal ---------------------------
+    n = counter.total()
+    state.set_mute(ids[0], True)
+    state.set_mute(ids[1], True)
+    ok = wait_result(counter, n)
+    wait_until(lambda: canvas.placeholder_text() == MUTE_PLACEHOLDER_TEXT
+               and not canvas.has_image())
+    check("<2 un-muted: canvas shows the un-mute placeholder",
+          ok and not canvas.has_image()
+          and canvas.placeholder_text() == MUTE_PLACEHOLDER_TEXT
+          and "Un-mute at least 2 images to blend" in canvas.placeholder_text(),
+          f"text={canvas.placeholder_text()!r}")
+    check("…which differs from the drop-images placeholder",
+          MUTE_PLACEHOLDER_TEXT != PLACEHOLDER_TEXT)
+    check("<2 un-muted: histogram empty", not window.histogram.has_data())
+    check("strip: BASE moves to the first un-muted row", strip.base_row() == 2)
+    window.last_notice = None
+    started = window.export_to(tmp / "refused.tif", "tiff")
+    check("<2 un-muted: export refused with a friendly message",
+          not started and window.last_notice is not None
+          and window.last_notice[1] == "Un-mute at least 2 images before exporting.",
+          f"notice={window.last_notice}")
+    dismiss_boxes()
+    window.last_notice = None
+    window.export_button.click()  # the toolbar button runs the same action
+    check("the toolbar Export button triggers the same action",
+          window.last_notice is not None and "Un-mute" in window.last_notice[1],
+          f"notice={window.last_notice}")
+    dismiss_boxes()
+
+    # -- solo overrides mute ---------------------------------------------------------------
+    entries = state.entries
+    n = counter.total()
+    state.set_solo(ids[0])  # a MUTED image
+    ok = wait_result(counter, n)
+    check("solo overrides mute: the muted image is shown",
+          ok and canvas.has_image()
+          and np.allclose(canvas.composite(), expected_single(entries[0], entries),
+                          atol=1e-6)
+          and canvas.solo_label() == "SOLO — one.png",
+          f"label={canvas.solo_label()}")
+    adj = dataclasses.replace(state.entry(ids[0]).adjustments, exposure=0.8)
+    n = counter.total()
+    state.set_adjustments(ids[0], adj)
+    wait_result(counter, n)
+    entries = state.entries
+    check("…with its adjustments applied",
+          np.allclose(canvas.composite(), expected_single(entries[0], entries),
+                      atol=1e-6))
+    state.set_adjustments(ids[0], dataclasses.replace(adj, exposure=0.0))
+    n = counter.total()
+    state.set_solo(None)
+    wait_result(counter, n)
+    wait_until(lambda: canvas.placeholder_text() == MUTE_PLACEHOLDER_TEXT)
+    check("un-solo with <2 un-muted returns to the un-mute placeholder",
+          not canvas.has_image() and canvas.placeholder_text() == MUTE_PLACEHOLDER_TEXT)
+
+    # -- Shift+M / M keys ----------------------------------------------------------------------
+    n = counter.total()
+    state.set_mute(ids[0], False)
+    state.set_mute(ids[1], False)
+    wait_result(counter, n)
+    settle(window)
+    strip.setCurrentRow(1)
+    for box in QApplication.topLevelWidgets():
+        if isinstance(box, QMessageBox):
+            box.close()
+    window.activateWindow()
+    wait_until(window.isActiveWindow, 2000)
+    QTest.keyClick(window, Qt.Key_M, Qt.ShiftModifier)
+    check("Shift+M mutes the selected row", state.is_muted(ids[1])
+          and not state.is_muted(ids[0]) and window.move_crop_action.isChecked() is False,
+          f"muted={[state.is_muted(i) for i in ids]} tool={window.move_crop_action.isChecked()}")
+    QTest.keyClick(window, Qt.Key_M, Qt.ShiftModifier)
+    check("Shift+M again un-mutes it", not state.is_muted(ids[1]))
+    strip.setFocus()
+    QTest.keyClick(strip, Qt.Key_M, Qt.ShiftModifier)
+    check("Shift+M with the strip focused mutes exactly once", state.is_muted(ids[1]),
+          f"muted={[state.is_muted(i) for i in ids]}")
+    state.set_mute(ids[1], False)
+    QTest.keyClick(window, Qt.Key_M)
+    check("plain M still toggles the Move / Crop tool (not mute)",
+          window.move_crop_action.isChecked() and state.unmuted_count() == 3)
+    QTest.keyClick(window, Qt.Key_M)
+    check("plain M toggles it back off", not window.move_crop_action.isChecked())
+    QTest.mouseClick(window.move_crop_button, Qt.LeftButton)
+    check("the LED toggle button drives the Move / Crop action",
+          window.move_crop_action.isChecked())
+    QTest.mouseClick(window.move_crop_button, Qt.LeftButton)
+    check("…and un-drives it", not window.move_crop_action.isChecked())
+    settle(window)
+
+    # -- preset round trip -----------------------------------------------------------------------
+    state.set_mute(ids[1], True)
+    preset = tmp / "mute.bsp"
+    window.save_preset_to(preset)
+    document = json.loads(preset.read_text(encoding="utf-8"))
+    check("preset carries mute (asdict round trip)",
+          document["images"][1]["adjustments"]["mute"] is True
+          and document["images"][0]["adjustments"]["mute"] is False
+          and dataclasses.asdict(state.entry(ids[1]).adjustments)["mute"] is True
+          and Adjustments.from_mapping(
+              dataclasses.asdict(state.entry(ids[1]).adjustments)).mute is True)
+    state.clear()
+    settle(window)
+    n = counter.total()
+    window.load_preset_from(preset)
+    wait_result(counter, n)
+    settle(window)
+    check("preset load restores mute + strip shows it",
+          [e.adjustments.mute for e in state.entries] == [False, True, False]
+          and [strip.is_muted(r) for r in range(3)] == [False, True, False])
+    want = expected_blend(window, paths)
+    check("loaded preset renders without the muted image",
+          float(np.abs(canvas.composite() - want).max()) <= 1e-6)
+
+    # -- export == preview --------------------------------------------------------------------------
+    done: list[tuple[bool, str]] = []
+    window.export_done.connect(lambda ok, msg: done.append((ok, msg)))
+    for label, muted_row in (("a larger image", 1), ("the smallest image", 2)):
+        for i in state.entry_ids():
+            state.set_mute(i, False)
+        state.set_mute(state.entry_ids()[muted_row], True)
+        wait_until(lambda: not window.preview._timer.isActive())
+        QTest.qWait(250)  # let the fold re-render with the new mute set
+        settle(window)
+        done.clear()
+        out = tmp / f"muted_{muted_row}.tif"
+        started = window.export_to(out, "tiff")
+        wait_until(lambda: bool(done), timeout_ms=30000)
+        check(f"export with {label} muted finished",
+              started and bool(done) and done[0][0], f"done={done}")
+        dismiss_boxes()
+        arr = iio.imread(out).astype(np.float32) / 65535.0
+        preview = canvas.composite()
+        check(f"export with {label} muted equals the preview",
+              arr.shape == preview.shape
+              and float(np.abs(arr - preview).max()) < 2e-3,
+              f"shape={arr.shape} vs {preview.shape} "
+              f"maxdiff={float(np.abs(arr - preview).max()) if arr.shape == preview.shape else None}")
+        want = expected_blend(window, paths)
+        check(f"export with {label} muted equals blend_arrays",
+              arr.shape == want.shape and float(np.abs(arr - want).max()) < 2e-3)
+    for i in state.entry_ids():
+        state.set_mute(i, False)
+    counter.disconnect()
+    settle(window)
+
+
+def _descendants(widget):
+    for child in widget.findChildren(QWidget):
+        if child.isVisible() and not child.isWindow():
+            yield child
+
+
+def check_layout(window: MainWindow, paths) -> None:
+    """Section 11: the one-screen rack layout at 1280x800 and 1200x720."""
+    reload_images(window, paths)
+    window.move_crop_action.setChecked(False)
+    hint = window.minimumSizeHint()
+    check("layout: window minimumSizeHint <= 1200 x 700",
+          hint.width() <= 1200 and hint.height() <= 700,
+          f"minimumSizeHint={hint.width()}x{hint.height()}")
+    check("layout: window minimum size equals the layout minimum",
+          window.minimumWidth() <= 1200 and window.minimumHeight() <= 700,
+          f"min={window.minimumWidth()}x{window.minimumHeight()}")
+    check("layout: no QScrollArea anywhere (controls_scroll is gone)",
+          not window.findChildren(QScrollArea) and not hasattr(window, "controls_scroll"))
+    for width, height in ((1280, 800), (1200, 720)):
+        window.resize(width, height)
+        QTest.qWait(150)
+        settle(window)
+        tag = f"{width}x{height}"
+        check(f"layout {tag}: window really is that size",
+              (window.width(), window.height()) == (width, height),
+              f"size={window.width()}x{window.height()}")
+        rack = window.rack
+        check(f"layout {tag}: rack <= 260 px tall", rack.height() <= 260,
+              f"rack={rack.width()}x{rack.height()}")
+        check(f"layout {tag}: rack spans the full window width",
+              rack.width() == window.centralWidget().width() == window.width(),
+              f"rack={rack.width()} window={window.width()}")
+        floor = 380 if height >= 800 else 300
+        check(f"layout {tag}: canvas >= {floor} px tall",
+              window.canvas.height() >= floor,
+              f"canvas={window.canvas.width()}x{window.canvas.height()}")
+        check(f"layout {tag}: strip is ~240 px wide",
+              230 <= window.strip.width() <= 260, f"strip={window.strip.width()}")
+        # nothing clipped: direct rack children
+        bad = []
+        for child in rack.findChildren(QWidget, options=Qt.FindDirectChildrenOnly):
+            if not child.isVisible():
+                continue
+            g, mh = child.geometry(), child.minimumSizeHint()
+            if not rack.rect().contains(g):
+                bad.append(f"{type(child).__name__} outside rack: {g}")
+            if g.width() < mh.width() or g.height() < mh.height():
+                bad.append(f"{type(child).__name__} {g.width()}x{g.height()} < "
+                           f"minimumSizeHint {mh.width()}x{mh.height()}")
+        check(f"layout {tag}: rack children inside the rack and not squeezed",
+              not bad, "; ".join(bad))
+        # nothing clipped: every visible descendant inside its parent
+        bad = []
+        for child in _descendants(window.centralWidget()):
+            parent = child.parentWidget()
+            if parent is None or isinstance(parent, QScrollArea):
+                continue
+            if type(parent).__name__.startswith("QAbstractScrollArea"):
+                continue
+            if not parent.rect().contains(child.geometry()):
+                bad.append(f"{type(child).__name__}({child.objectName()}) "
+                           f"{child.geometry()} not inside {type(parent).__name__} "
+                           f"{parent.rect()}")
+        check(f"layout {tag}: every visible widget is inside its parent (no clipping)",
+              not bad, "; ".join(bad[:4]))
+        check(f"layout {tag}: central row (strip + canvas) is above the rack",
+              window.canvas.geometry().bottom() < rack.geometry().top() + window.centralWidget().geometry().top()
+              or window.canvas.mapTo(window, window.canvas.rect().bottomLeft()).y()
+              < rack.mapTo(window, rack.rect().topLeft()).y())
+        status = window.statusBar()
+        check(f"layout {tag}: status bar visible, monospace",
+              status.isVisible() and window.info_label.isVisible()
+              and status.font().styleHint() == status.font().StyleHint.Monospace
+              if hasattr(status.font(), "StyleHint") else status.isVisible())
+        print(f"       {tag}: strip={window.strip.width()}x{window.strip.height()} "
+              f"canvas={window.canvas.width()}x{window.canvas.height()} "
+              f"rack={rack.width()}x{rack.height()} min={hint.width()}x{hint.height()}")
+    # crop mode must not blow the minimum size (crop bar under the canvas)
+    window.move_crop_action.setChecked(True)
+    settle(window)
+    window.canvas.enter_crop_mode()
+    QTest.qWait(50)
+    hint = window.minimumSizeHint()
+    check("layout: crop bar visible in crop mode and minimum still <= 1200 x 700",
+          window.crop_bar.isVisible() and hint.width() <= 1200 and hint.height() <= 700,
+          f"minimumSizeHint={hint.width()}x{hint.height()}")
+    window.canvas.exit_crop_mode()
+    window.move_crop_action.setChecked(False)
+    window.resize(1280, 800)
+    QTest.qWait(100)
+
 
 
 def main() -> int:
@@ -737,9 +1167,9 @@ def main() -> int:
 
     # -- 3. slider changes re-render (generation counter advances) -------------
     gen_before = window.preview.completed_generation
-    window.blend_controls.softness_row.slider.setValue(30)  # user-style edit
+    window.blend_controls.softness_row.set_value_from_user(30.0)  # user-style edit
     window.strip.setCurrentRow(0)
-    window.adjustments_panel.exposure_row.slider.setValue(100)  # +1.00 EV
+    window.adjustments_panel.exposure_row.set_value_from_user(1.0)  # +1.00 EV
     ok = wait_until(
         lambda: render_settled(window)
         and window.preview.completed_generation > gen_before
@@ -834,7 +1264,7 @@ def main() -> int:
 
     # Restore a Canon mode + softness for the remaining round-trip checks.
     _select_mode("canon_bright")
-    window.blend_controls.softness_row.slider.setValue(30)
+    window.blend_controls.softness_row.set_value_from_user(30.0)
     wait_until(lambda: render_settled(window))
     check("canon softness re-applied after preset detour",
           window.state.params.get("softness") == 30.0,
@@ -890,6 +1320,8 @@ def main() -> int:
     check_move(window, [p1, p2, p3])
     check_crop(window, [p1, p2, p3])
     check_export_and_presets(window, [p1, p2, p3], tmp)
+    check_mute(window, [p1, p2, p3], tmp)
+    check_layout(window, [p1, p2, p3])
     window.state.clear()
     settle(window)
     window.add_files([p1, p2, p3])

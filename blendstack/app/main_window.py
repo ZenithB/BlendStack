@@ -1,16 +1,28 @@
 """Main window — assembles the standalone app (project brief §5).
 
-Layout: left = reorderable image strip (fold order, top = base image);
-centre = live preview canvas; right = per-image adjustments panel, global
-blend controls and the composite histogram.  Toolbar: Open, Save Preset,
-Load Preset, Export and the checkable **Move / Crop** tool (key M).
+A one-screen "synth rack" layout, nothing scrolls::
+
+    ┌ toolbar: logo · Open · Save · Load · [Move/Crop LED] ……………… EXPORT ┐
+    │ image strip (≈240 px)  │  preview canvas (expands; crop bar under it) │
+    ├ rack (full width): BlendControls │ AdjustmentsPanel │ HistogramWidget ┤
+    └ status bar ────────────────────────────────────────────────────────┘
+
+The strip (left) is the reorderable fold list — top = base image — with a
+per-row **M**ute and **S**olo button.  A muted image is removed from the blend
+(it still sizes the canvas, so nothing shifts when it is toggled; Shift+M on
+the selected row).  The bottom rack holds the global blend knobs, the
+per-image adjustments (IMAGE knobs | CURVES | ORDER) and the composite
+histogram; it takes its height from those panels.
+
+Toolbar: Open, Save Preset, Load Preset, the checkable **Move / Crop** tool
+(key M, shown as an LED toggle) and, on the right, a gold **Export** button.
 
 Move / Crop tool (on): the preview shows the FULL canvas; dragging in the
 preview moves the selected image (``move_x`` / ``move_y`` fractions, stored in
 its :class:`Adjustments`); double-clicking enters crop mode (rectangle with 8
 handles; Apply / Cancel / Reset crop in a slim bar under the canvas, Enter /
-Esc as shortcuts).  Solo (per-row "S" in the image strip) previews one image
-in isolation.  Export honours placement and crop.
+Esc as shortcuts).  Solo previews one image in isolation (overrides mute).
+Export honours placement, crop and mute.
 
 Export (brief §5 / §4.4) runs the **full-resolution** pipeline via
 ``engine.blend_files`` (streams one file at a time, memory-bounded) on a
@@ -25,9 +37,21 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtCore import QObject, QPointF, QSize, Qt, QThread, Signal, Slot
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QFont,
+    QFontMetrics,
+    QGuiApplication,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QRadialGradient,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -36,17 +60,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QScrollArea,
+    QSizePolicy,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from blendstack.core import engine
+from blendstack import __version__
+from blendstack.core import engine, geometry
 from blendstack.core import io as bs_io
 from blendstack.core.adjustments import Adjustments
 
-from . import canvas_tools, presets
+from . import canvas_tools, presets, theme
 from .adjustments_panel import AdjustmentsPanel
 from .blend_controls import BlendControls
 from .histogram import HistogramWidget
@@ -66,6 +92,9 @@ _EXPORT_FILTERS = (
     ("PNG, 16-bit (*.png)", "png"),
     ("JPEG, 8-bit (*.jpg *.jpeg)", "jpeg"),
 )
+
+#: Width of the image-strip column.
+_STRIP_WIDTH = 244
 
 
 class _ExportWorker(QObject):
@@ -111,6 +140,140 @@ class _ExportWorker(QObject):
         self.finished.emit(written)
 
 
+# ----------------------------------------------------------------- shell widgets
+
+
+class _Logo(QWidget):
+    """"BLEND" (text colour) + "STACK" (gold), bold and letter-spaced, with a
+    tiny dim monospace version tag."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._font = theme.label_font(15, bold=True)
+        self._font.setLetterSpacing(QFont.AbsoluteSpacing, 3.0)
+        self._tag_font = theme.mono_font(9)
+        self._tag = f"v{__version__}"
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def _widths(self) -> tuple[int, int, int]:
+        fm = QFontMetrics(self._font)
+        return (
+            fm.horizontalAdvance("BLEND"),
+            fm.horizontalAdvance("STACK"),
+            QFontMetrics(self._tag_font).horizontalAdvance(self._tag),
+        )
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        blend, stack, tag = self._widths()
+        return QSize(blend + stack + tag + 18, 30)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+        blend, stack, _tag = self._widths()
+        p.setFont(self._font)
+        fm = QFontMetrics(self._font)
+        base = (self.height() + fm.ascent() - fm.descent()) // 2
+        p.setPen(theme.color(theme.TEXT))
+        p.drawText(0, base, "BLEND")
+        p.setPen(theme.color(theme.GOLD[0]))
+        p.drawText(blend, base, "STACK")
+        p.setFont(self._tag_font)
+        p.setPen(theme.color(theme.TEXT_DIM))
+        p.drawText(blend + stack + 10, base, self._tag)
+        p.end()
+
+
+class _LedToolButton(QToolButton):
+    """A checkable tool button with an LED dot: dim when off, glowing green
+    when on.  Wraps a ``QAction`` (the action stays the public API)."""
+
+    _STYLE = f"""
+    QToolButton {{ background: {theme.INSET}; color: {theme.TEXT};
+        border: 1px solid {theme.BORDER_HI}; border-radius: 4px;
+        padding: 5px 12px 5px 30px; }}
+    QToolButton:hover {{ border-color: {theme.GOLD[0]}; color: {theme.TEXT}; }}
+    QToolButton:checked {{ background: {theme.INSET}; color: {theme.TEXT};
+        border-color: {theme.GREEN[0]}; }}
+    """
+
+    def __init__(self, action: QAction, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setDefaultAction(action)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setStyleSheet(self._STYLE)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        c = QPointF(16.0, self.height() / 2.0)
+        if self.isChecked():
+            glow = QRadialGradient(c, 9.0)
+            glow.setColorAt(0.0, theme.color(theme.GREEN[0], 150))
+            glow.setColorAt(1.0, theme.color(theme.GREEN[0], 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(glow)
+            p.drawEllipse(c, 9.0, 9.0)
+            p.setBrush(theme.color(theme.GREEN[0]))
+            p.setPen(QPen(theme.color(theme.GREEN[3]), 1.0))
+        else:
+            p.setBrush(theme.color(theme.GREEN[4]))
+            p.setPen(QPen(theme.color(theme.BORDER_HI), 1.0))
+        p.drawEllipse(c, 4.5, 4.5)
+        p.end()
+
+
+class _Rack(QFrame):
+    """The bottom rack: a slightly raised panel spanning the window with a
+    thin outline, a top highlight and gold rack screws in
+    the "ears" at either end."""
+
+    EAR = 16  # width of the screw ears left and right
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("rack")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        r = self.rect()
+        p.fillRect(r, theme.color(theme.PANEL))
+        # top border + a subtle highlight line just under it
+        p.setPen(QPen(theme.color(theme.BORDER), 1.0))
+        p.drawLine(0, 0, r.width(), 0)
+        p.setPen(QPen(theme.color(theme.PANEL_HI), 1.0))
+        p.drawLine(0, 1, r.width(), 1)
+        # ears (rails) with screws
+        rail = theme.color(theme.BG, 120)
+        p.fillRect(0, 2, self.EAR, r.height() - 2, rail)
+        p.fillRect(r.width() - self.EAR, 2, self.EAR, r.height() - 2, rail)
+        p.setPen(QPen(theme.color(theme.BORDER), 1.0))
+        p.drawLine(self.EAR, 2, self.EAR, r.height())
+        p.drawLine(r.width() - self.EAR, 2, r.width() - self.EAR, r.height())
+        for x in (self.EAR / 2.0, r.width() - self.EAR / 2.0):
+            for y in (14.0, r.height() - 14.0):
+                self._screw(p, QPointF(x, y))
+        p.end()
+
+    @staticmethod
+    def _screw(p: QPainter, c: QPointF) -> None:
+        grad = QRadialGradient(c - QPointF(1.0, 1.0), 6.0)
+        grad.setColorAt(0.0, theme.color(theme.GOLD[0]))
+        grad.setColorAt(1.0, theme.color(theme.GOLD[3]))
+        p.setPen(QPen(theme.color(theme.GOLD[4]), 1.0))
+        p.setBrush(grad)
+        p.drawEllipse(c, 4.0, 4.0)
+        p.setPen(QPen(theme.color(theme.GOLD[4]), 1.2))
+        p.drawLine(QPointF(c.x() - 2.4, c.y() + 0.6), QPointF(c.x() + 2.4, c.y() - 0.6))
+
+
 class MainWindow(QMainWindow):
     """The BlendStack standalone app window (brief §5)."""
 
@@ -119,8 +282,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        theme.apply(QApplication.instance())
         self.setWindowTitle("BlendStack")
-        self._apply_initial_geometry()
         self.setAcceptDrops(True)
 
         self.state = DocumentState(self)
@@ -141,43 +304,40 @@ class MainWindow(QMainWindow):
         self.blend_controls = BlendControls(self)
         self.histogram = HistogramWidget(self)
 
+        # Left column: the image strip under a small header.
+        strip_title = QLabel("IMAGES", self)
+        strip_title.setProperty("role", "title")
+        strip_hint = QLabel("fold order · top = base", self)
+        strip_hint.setProperty("role", "dim")
+        strip_hint.setFont(theme.label_font(10))
+        strip_header = QHBoxLayout()
+        strip_header.setContentsMargins(2, 0, 2, 0)
+        strip_header.addWidget(strip_title)
+        strip_header.addStretch(1)
+        strip_header.addWidget(strip_hint)
         strip_column = QVBoxLayout()
-        strip_label = QLabel("Images — fold order (top = base)", self)
-        strip_label.setWordWrap(True)
-        strip_column.addWidget(strip_label)
+        strip_column.setContentsMargins(0, 0, 0, 0)
+        strip_column.setSpacing(6)
+        strip_column.addLayout(strip_header)
         strip_column.addWidget(self.strip, 1)
-
-        # The control panels live in a vertical scroll area so their combined
-        # height can never set the window's minimum height. Without this the
-        # stacked panels forced a minimum taller than a laptop screen, which
-        # made macOS pin the window to the top and refuse vertical resizing.
-        # The histogram stays outside the scroll area so it is always visible.
-        controls = QWidget(self)
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.addWidget(self.adjustments_panel)
-        controls_layout.addWidget(self.blend_controls)
-        controls_layout.addStretch(1)
-        self.controls_scroll = QScrollArea(self)
-        self.controls_scroll.setWidgetResizable(True)
-        self.controls_scroll.setFrameShape(QFrame.NoFrame)
-        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.controls_scroll.setWidget(controls)
-
-        right_column = QVBoxLayout()
-        right_column.addWidget(self.controls_scroll, 1)
-        right_column.addWidget(QLabel("Composite histogram", self))
-        right_column.addWidget(self.histogram)
-        right = QWidget(self)
-        right.setLayout(right_column)
-        right.setFixedWidth(330)
+        strip_holder = QWidget(self)
+        strip_holder.setLayout(strip_column)
+        strip_holder.setFixedWidth(_STRIP_WIDTH)
 
         # Slim crop bar attached under the canvas; visible only in crop mode.
         self.crop_bar = QFrame(self)
-        self.crop_bar.setFrameShape(QFrame.StyledPanel)
+        self.crop_bar.setProperty("panel", True)
         crop_bar_layout = QHBoxLayout(self.crop_bar)
-        crop_bar_layout.setContentsMargins(8, 2, 8, 2)
-        crop_bar_layout.addWidget(QLabel("Crop", self.crop_bar))
+        crop_bar_layout.setContentsMargins(10, 4, 8, 4)
+        crop_title = QLabel("CROP", self.crop_bar)
+        crop_title.setProperty("role", "title")
+        crop_hint = QLabel("drag the handles or the box · Enter = Apply · Esc = Cancel",
+                           self.crop_bar)
+        crop_hint.setProperty("role", "dim")
+        crop_hint.setFont(theme.label_font(10))
+        crop_bar_layout.addWidget(crop_title)
+        crop_bar_layout.addSpacing(8)
+        crop_bar_layout.addWidget(crop_hint)
         crop_bar_layout.addStretch(1)
         self.reset_crop_button = QPushButton("Reset crop", self.crop_bar)
         self.cancel_crop_button = QPushButton("Cancel", self.crop_bar)
@@ -185,26 +345,63 @@ class MainWindow(QMainWindow):
         self.reset_crop_button.setToolTip("Remove the applied crop")
         self.cancel_crop_button.setToolTip("Discard this crop edit (Esc)")
         self.apply_crop_button.setToolTip("Apply the crop (Enter)")
+        self.reset_crop_button.setProperty("variant", "ghost")
+        self.cancel_crop_button.setProperty("variant", "ghost")
+        self.apply_crop_button.setProperty("variant", "primary")
         self.apply_crop_button.setDefault(True)
         for button in (self.reset_crop_button, self.cancel_crop_button,
                        self.apply_crop_button):
+            button.setFixedHeight(26)
             crop_bar_layout.addWidget(button)
         self.crop_bar.hide()
 
+        # Header above the canvas mirrors the strip's header so both columns
+        # start on the same line; the readout shows the frame being displayed.
+        preview_title = QLabel("PREVIEW", self)
+        preview_title.setProperty("role", "title")
+        self.preview_info = QLabel("", self)
+        self.preview_info.setProperty("role", "dim")
+        self.preview_info.setFont(theme.mono_font(10))
+        preview_header = QHBoxLayout()
+        preview_header.setContentsMargins(2, 0, 2, 0)
+        preview_header.addWidget(preview_title)
+        preview_header.addStretch(1)
+        preview_header.addWidget(self.preview_info)
+
         canvas_column = QVBoxLayout()
         canvas_column.setContentsMargins(0, 0, 0, 0)
-        canvas_column.setSpacing(0)
+        canvas_column.setSpacing(6)
+        canvas_column.addLayout(preview_header)
         canvas_column.addWidget(self.canvas, 1)
         canvas_column.addWidget(self.crop_bar)
 
+        top = QWidget(self)
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(12, 12, 12, 10)
+        top_layout.setSpacing(12)
+        top_layout.addWidget(strip_holder)
+        top_layout.addLayout(canvas_column, 1)
+
+        # Bottom rack: blend controls | adjustments (the slack) | histogram.
+        self.rack = _Rack(self)
+        rack_layout = QHBoxLayout(self.rack)
+        rack_layout.setContentsMargins(_Rack.EAR + 12, 6, _Rack.EAR + 12, 6)
+        rack_layout.setSpacing(16)
+        rack_layout.addWidget(self.blend_controls, 0)
+        rack_layout.addWidget(self.adjustments_panel, 1)
+        rack_layout.addWidget(self.histogram, 0)
+
         central = QWidget(self)
-        layout = QHBoxLayout(central)
-        layout.addLayout(strip_column)
-        layout.addLayout(canvas_column, 1)
-        layout.addWidget(right)
+        central.setObjectName("central")
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(top, 1)
+        central_layout.addWidget(self.rack, 0)
         self.setCentralWidget(central)
 
         self._build_toolbar()
+        self._build_status_bar()
         # Enter = Apply / Esc = Cancel, active only while cropping.
         self._crop_shortcuts = [
             QShortcut(QKeySequence(key), self, self._apply_crop)
@@ -239,6 +436,7 @@ class MainWindow(QMainWindow):
         self.strip.remove_requested.connect(self.state.remove)
         self.strip.selection_changed.connect(self._on_selection_changed)
         self.strip.solo_requested.connect(self.state.set_solo)
+        self.strip.mute_requested.connect(self._on_mute_requested)
         self.strip.reset_position_requested.connect(self.state.reset_placement)
         self.adjustments_panel.adjustments_edited.connect(self._on_panel_edited)
         self.blend_controls.mode_changed.connect(self.state.set_mode)
@@ -256,33 +454,42 @@ class MainWindow(QMainWindow):
 
         self.blend_controls.set_from_state(self.state.mode, self.state.params)
         self.canvas.clear()
+        self._update_info()
+
+        # The layout's true minimum is the window minimum; size/centre on the
+        # screen the window opens on (still freely resizable and movable).
+        self.setMinimumSize(self.minimumSizeHint())
+        self._apply_initial_geometry()
 
     # ------------------------------------------------------------------ toolbar
 
     def _apply_initial_geometry(self) -> None:
         """Open at a comfortable size that always fits the screen, centred.
 
-        The window stays freely movable and resizable afterwards: no fixed or
-        oversized minimum is set, so it can be shrunk well below this size.
+        The window stays freely movable and resizable afterwards; its minimum
+        is the layout's true minimum size.
         """
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:  # no screen info (rare): keep a sane default
             self.resize(1280, 800)
             return
         avail = screen.availableGeometry()
-        width = min(1280, int(avail.width() * 0.92))
-        height = min(800, int(avail.height() * 0.88))
+        min_hint = self.minimumSizeHint()
+        width = max(min(1280, int(avail.width() * 0.92)), min_hint.width())
+        height = max(min(800, int(avail.height() * 0.88)), min_hint.height())
         self.resize(width, height)
         self.move(
-            avail.x() + (avail.width() - width) // 2,
-            avail.y() + (avail.height() - height) // 2,
+            avail.x() + max(0, (avail.width() - width) // 2),
+            avail.y() + max(0, (avail.height() - height) // 2),
         )
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main", self)
         toolbar.setMovable(False)
+        toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.addToolBar(toolbar)
+        self.toolbar = toolbar
 
         self.open_action = QAction("Open…", self)
         self.open_action.triggered.connect(self._open_dialog)
@@ -299,15 +506,64 @@ class MainWindow(QMainWindow):
             "Move / Crop (M) — drag to move the selected image; "
             "double-click the canvas to crop"
         )
-        for action in (
-            self.open_action,
-            self.save_preset_action,
-            self.load_preset_action,
-            self.export_action,
-        ):
+        # Shift+M: mute / un-mute the image selected in the strip (plain M stays
+        # the Move / Crop tool).
+        self.mute_action = QAction("Mute / Unmute selected image", self)
+        self.mute_action.setShortcut(QKeySequence("Shift+M"))
+        self.mute_action.setShortcutContext(Qt.WindowShortcut)
+        self.mute_action.triggered.connect(self._toggle_selected_mute)
+        self.addAction(self.mute_action)
+
+        toolbar.addWidget(_Logo(toolbar))
+        spacer = QWidget(toolbar)
+        spacer.setFixedWidth(14)
+        toolbar.addWidget(spacer)
+        for action in (self.open_action, self.save_preset_action,
+                       self.load_preset_action):
             toolbar.addAction(action)
+            button = toolbar.widgetForAction(action)
+            if button is not None:
+                button.setProperty("variant", "ghost")
+                button.setCursor(Qt.PointingHandCursor)
         toolbar.addSeparator()
-        toolbar.addAction(self.move_crop_action)
+        self.move_crop_button = _LedToolButton(self.move_crop_action, toolbar)
+        toolbar.addWidget(self.move_crop_button)
+
+        stretch = QWidget(toolbar)
+        stretch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(stretch)
+
+        self.export_button = QPushButton("EXPORT", toolbar)
+        self.export_button.setProperty("variant", "primary")
+        self.export_button.setToolTip("Export the full-resolution blend")
+        self.export_button.setCursor(Qt.PointingHandCursor)
+        self.export_button.setMinimumWidth(110)
+        self.export_button.setFixedHeight(30)
+        self.export_button.clicked.connect(self.export_action.trigger)
+        toolbar.addWidget(self.export_button)
+
+    def _build_status_bar(self) -> None:
+        bar = self.statusBar()
+        bar.setFont(theme.mono_font(10))
+        bar.setSizeGripEnabled(False)
+        self.info_label = QLabel("", bar)
+        self.info_label.setFont(theme.mono_font(10))
+        self.info_label.setProperty("role", "dim")
+        self.info_label.setContentsMargins(0, 0, 14, 0)
+        bar.addPermanentWidget(self.info_label)
+
+    def _update_info(self) -> None:
+        """Permanent status readout: image count, blend count, canvas size."""
+        entries = self.state.entries
+        if not entries:
+            self.info_label.setText("no images")
+            return
+        active = self.state.unmuted_count()
+        canvas = geometry.target_dimensions([e.full_size for e in entries])
+        self.info_label.setText(
+            f"{len(entries)} images · {active} in blend · "
+            f"canvas {canvas[0]}×{canvas[1]}"
+        )
 
     # -------------------------------------------------------------- notifications
 
@@ -355,6 +611,7 @@ class MainWindow(QMainWindow):
 
     def _sync_strip(self) -> None:
         self.strip.sync(self.state.entries)
+        self._update_info()
 
     # ---------------------------------------------------------- selection wiring
 
@@ -368,29 +625,48 @@ class MainWindow(QMainWindow):
         entry_id = self.strip.current_entry_id()
         entry = None if entry_id is None else self.state.entry(entry_id)
         if entry is not None:
-            # Placement belongs to the canvas Move tool: whatever the panel
-            # emits, never let it clobber the layer's position.
+            # Placement belongs to the canvas Move tool and mute to the strip:
+            # whatever the panel emits, never let it clobber them.
             adjustments = replace(
                 adjustments,
                 move_x=entry.adjustments.move_x,
                 move_y=entry.adjustments.move_y,
+                mute=entry.adjustments.mute,
             )
             self.state.set_adjustments(entry_id, adjustments)
 
     def _on_state_adjustments(self, entry_id: int) -> None:
+        entry = self.state.entry(entry_id)
+        if entry is None:
+            return
+        self.strip.set_muted(entry_id, entry.adjustments.mute)
+        self._update_info()
         # Keep the panel in sync if state changed underneath it (preset load).
         if entry_id == self.strip.current_entry_id():
-            entry = self.state.entry(entry_id)
-            if entry is not None:
-                current = entry.adjustments
-                shown = replace(
-                    self.adjustments_panel.values(),
-                    move_x=current.move_x, move_y=current.move_y,
-                )
-                if shown != current:  # skip pure placement changes (drags)
-                    self.adjustments_panel.set_values(current)
+            current = entry.adjustments
+            shown = replace(
+                self.adjustments_panel.values(),
+                move_x=current.move_x, move_y=current.move_y, mute=current.mute,
+            )
+            if shown != current:  # skip pure placement / mute changes
+                self.adjustments_panel.set_values(current)
 
-    # ------------------------------------------------------------ solo / tools
+    # ------------------------------------------------------------ mute / solo / tools
+
+    def _on_mute_requested(self, entry_id: int, muted: bool) -> None:
+        """Strip M button / Shift+M / context menu → document state."""
+        self.state.set_mute(entry_id, muted)
+        entry = self.state.entry(entry_id)
+        if entry is not None:
+            active = self.state.unmuted_count()
+            verb = "Muted" if muted else "Un-muted"
+            self._hint(f"{verb} {entry.path.name} — {active} image"
+                       f"{'' if active == 1 else 's'} in the blend.")
+
+    def _toggle_selected_mute(self) -> None:
+        entry_id = self.strip.current_entry_id()
+        if entry_id is not None:
+            self._on_mute_requested(entry_id, not self.state.is_muted(entry_id))
 
     def _on_solo_changed(self, entry_id: Optional[int]) -> None:
         self.strip.set_solo_id(entry_id)
@@ -472,10 +748,15 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.canvas.set_composite(composite, full_canvas)
         self.histogram.set_data(histogram)
+        h, w = composite.shape[:2]
+        kind = ("SOLO" if self.state.solo_id is not None
+                else "full canvas" if full_canvas else "cropped")
+        self.preview_info.setText(f"{w}×{h} px · {kind}")
 
     def _on_preview_cleared(self, message: str) -> None:
         self.canvas.clear(message)
         self.histogram.set_data(None)
+        self.preview_info.setText("")
 
     # -------------------------------------------------------------------- presets
 
@@ -536,12 +817,24 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------------- export
 
-    def _export_dialog(self) -> None:
+    def _export_ready(self) -> bool:
+        """Friendly pre-check: enough images, and enough of them un-muted."""
         if len(self.state.entries) < engine.MIN_IMAGES:
             self._notify(
                 "Nothing to export",
                 f"Add at least {engine.MIN_IMAGES} images before exporting.",
             )
+            return False
+        if self.state.unmuted_count() < engine.MIN_IMAGES:
+            self._notify(
+                "Nothing to export",
+                f"Un-mute at least {engine.MIN_IMAGES} images before exporting.",
+            )
+            return False
+        return True
+
+    def _export_dialog(self) -> None:
+        if self._export_thread is None and not self._export_ready():
             return
         default_name = bs_io.default_filename(
             self.state.mode, self.state.output_format
@@ -572,19 +865,17 @@ class MainWindow(QMainWindow):
         """Start a full-resolution export on a background thread.
 
         Returns True if the export was started.  Completion is announced
-        via a dialog and the :attr:`export_done` signal.
+        via a dialog and the :attr:`export_done` signal.  Muted images are
+        left out (and never loaded); fewer than 2 un-muted images is refused
+        with a friendly message.
         """
         if self._export_thread is not None:
             self._notify("Export in progress",
                          "Wait for the current export to finish.")
             return False
-        entries = self.state.entries
-        if len(entries) < engine.MIN_IMAGES:
-            self._notify(
-                "Nothing to export",
-                f"Add at least {engine.MIN_IMAGES} images before exporting.",
-            )
+        if not self._export_ready():
             return False
+        entries = self.state.entries
         self.state.output_format = out_format
 
         worker = _ExportWorker(

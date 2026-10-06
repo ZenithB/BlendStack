@@ -46,7 +46,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication
 
 __all__ = [
@@ -56,7 +56,7 @@ __all__ = [
     "ACCENT", "ACCENT_HI", "ACCENT_LO", "LED_ON", "MUTE", "SOLO",
     "CHANNEL_R", "CHANNEL_G", "CHANNEL_B", "CHANNEL_L",
     "color", "contrast_ratio", "relative_luminance", "text_pairs",
-    "mono_font", "label_font", "title_font", "stylesheet", "apply",
+    "mono_font", "label_font", "title_font", "mono_family", "sans_family", "stylesheet", "apply",
 ]
 
 # --------------------------------------------------------------------- palette
@@ -152,10 +152,37 @@ def text_pairs() -> list[tuple[str, str, str, float]]:
 
 # ----------------------------------------------------------------------- fonts
 
+_MONO_CANDIDATES = ("SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", "Courier New")
+_SANS_CANDIDATES = ("SF Pro Text", "Helvetica Neue", "Segoe UI", "Arial")
+_family_cache: dict[tuple, str] = {}
+
+
+def _first_installed(candidates: tuple[str, ...], fallback: str) -> str:
+    """The first candidate font family actually installed on this machine.
+
+    Listing families that don't exist makes Qt scan for aliases at startup and
+    log a "missing font family" warning, so pick one that is really there.
+    """
+    if candidates not in _family_cache:
+        installed = set(QFontDatabase.families())
+        _family_cache[candidates] = next(
+            (c for c in candidates if c in installed), fallback)
+    return _family_cache[candidates]
+
+
+def mono_family() -> str:
+    """Installed monospace family used for numeric readouts."""
+    return _first_installed(_MONO_CANDIDATES, "Courier")
+
+
+def sans_family() -> str:
+    """Installed UI sans-serif family used for labels."""
+    return _first_installed(_SANS_CANDIDATES, "Helvetica")
+
+
 def mono_font(size: int = 10, bold: bool = False) -> QFont:
     """Monospace font for numeric readouts."""
-    f = QFont()
-    f.setFamilies(["SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", "monospace"])
+    f = QFont(mono_family())
     f.setStyleHint(QFont.Monospace)
     f.setPointSize(size)
     f.setBold(bold)
@@ -164,8 +191,7 @@ def mono_font(size: int = 10, bold: bool = False) -> QFont:
 
 def label_font(size: int = 10, bold: bool = False) -> QFont:
     """Clean UI sans for labels."""
-    f = QFont()
-    f.setFamilies(["SF Pro Text", "Helvetica Neue", "Segoe UI", "Arial", "sans-serif"])
+    f = QFont(sans_family())
     f.setPointSize(size)
     f.setBold(bold)
     return f
@@ -199,7 +225,7 @@ QFrame[inset="true"] {{ background: {INSET}; border: 1px solid {BORDER}; border-
 QLabel {{ color: {TEXT}; background: transparent; }}
 QLabel[role="title"] {{ color: {GOLD[0]}; font-size: 10px; font-weight: 700; letter-spacing: 1.4px; }}
 QLabel[role="dim"] {{ color: {TEXT_DIM}; }}
-QLabel[role="value"] {{ color: {GOLD[0]}; font-family: "SF Mono", Menlo, Consolas, monospace; }}
+QLabel[role="value"] {{ color: {GOLD[0]}; font-family: "{mono_family()}"; }}
 
 /* ---- buttons ---- */
 QPushButton, QToolButton {{

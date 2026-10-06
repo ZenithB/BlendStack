@@ -24,6 +24,13 @@ Threading model
   with ``engine.apply_crop`` unless the request asks for the full canvas
   (Move / Crop tool on).
 
+* **Mute**: a muted image (``adjustments.mute``) still counts for the canvas
+  size (smallest by area over ALL images, exactly like the core engine, so
+  layer positions and the crop never shift when mute is toggled) but is
+  skipped in the fold — no scale / adjust work is done for it.  Fewer than 2
+  un-muted images → no render (the canvas shows a "Un-mute at least 2 images"
+  placeholder).  *Solo* overrides mute: a soloed muted image is shown.
+
 * **Caching** (brief §5): ``cover_scale`` results are cached by
   ``(entry id, target dims)`` and adjusted images by
   ``(entry id, target dims, adj.adjust_key())``.  ``adjust_key`` covers every
@@ -54,13 +61,14 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QRadialGradient,
 )
 from PySide6.QtWidgets import QWidget
 
 from blendstack.core import engine, geometry
 from blendstack.core.adjustments import Adjustments, rec709_luma
 
-from . import canvas_tools
+from . import canvas_tools, theme
 from .canvas_tools import CropEditor
 from .state import DocumentState
 
@@ -72,6 +80,8 @@ __all__ = [
     "RenderWorker",
     "PreviewController",
     "PreviewCanvas",
+    "PLACEHOLDER_TEXT",
+    "MUTE_PLACEHOLDER_TEXT",
 ]
 
 #: Debounce interval for preview re-renders (brief §5: ~80 ms).
@@ -81,6 +91,12 @@ DEBOUNCE_MS = 80
 PLACEHOLDER_TEXT = (
     "Drop 2–20 images here to blend\n"
     "(or use Open in the toolbar)"
+)
+
+#: Placeholder shown when >= 2 images are loaded but fewer than 2 are un-muted.
+MUTE_PLACEHOLDER_TEXT = (
+    "Un-mute at least 2 images to blend\n"
+    "(click M on a row, or press Shift+M)"
 )
 
 
@@ -250,7 +266,11 @@ class RenderWorker(QObject):
                 composite, _mask = self._placed(solo, target)
             else:
                 fold = engine.BlendFold(request.mode, request.params)
+                # Muted images size the canvas (above) but never enter the
+                # fold, so they cost no scale / adjust work.
                 for item in request.items:
+                    if item.adjustments.mute:
+                        continue
                     if self._stale(generation):
                         return
                     placed, mask = self._placed(item, target)
@@ -341,10 +361,14 @@ class PreviewController(QObject):
         solo_id = self._state.solo_id
         if solo_id is not None and not any(e.entry_id == solo_id for e in entries):
             solo_id = None
-        if solo_id is None and len(entries) < engine.MIN_IMAGES:
+        active = sum(1 for e in entries if not e.adjustments.mute)
+        if solo_id is None and active < engine.MIN_IMAGES:
             # Invalidate any in-flight render and show the placeholder.
             self.completed_generation = self._clock.advance()
-            self.preview_cleared.emit(PLACEHOLDER_TEXT)
+            self.preview_cleared.emit(
+                PLACEHOLDER_TEXT if len(entries) < engine.MIN_IMAGES
+                else MUTE_PLACEHOLDER_TEXT
+            )
             return
         generation = self._clock.advance()
         request = RenderRequest(
@@ -388,9 +412,6 @@ class PreviewController(QObject):
         self._thread.wait(3000)
 
 
-_ACCENT = QColor(255, 170, 0)
-
-
 class PreviewCanvas(QWidget):
     """Centre preview canvas: scaled-to-fit, aspect preserved (brief §5).
 
@@ -402,8 +423,12 @@ class PreviewCanvas(QWidget):
       derived from the letterboxed display rectangle) / :attr:`drag_finished`.
     * Double-click enters crop mode: a :class:`~canvas_tools.CropEditor`
       overlay on the full canvas; drags then edit the rectangle instead.
-    * A translucent "SOLO — name" banner is drawn top-left while a label is
-      set (:meth:`set_solo_label`).
+    * A gold "SOLO — name" pill is drawn top-left while a label is set
+      (:meth:`set_solo_label`).
+
+    The canvas is a recessed "screen": near-black inset, a 1 px frame, corner
+    registration marks and a soft vignette; placeholders are centred with a
+    small drawn glyph.
     """
 
     drag_started = Signal()
@@ -417,6 +442,7 @@ class PreviewCanvas(QWidget):
         self._composite: Optional[np.ndarray] = None
         self._frame_full = False
         self._placeholder = PLACEHOLDER_TEXT
+        self._banner_rect = QRectF()
         self._tool = False
         self._applied_crop: Optional[tuple[float, float, float, float]] = None
         self._solo_label: Optional[str] = None
@@ -449,6 +475,14 @@ class PreviewCanvas(QWidget):
             self.exit_crop_mode()
         self._update_cursor()
         self.update()
+
+    def placeholder_text(self) -> str:
+        """The placeholder text shown while no frame is displayed."""
+        return self._placeholder
+
+    def solo_banner_rect(self) -> QRectF:
+        """Where the SOLO pill was last painted (widget pixels; empty if none)."""
+        return QRectF(self._banner_rect)
 
     def has_image(self) -> bool:
         return self._pixmap is not None and not self._pixmap.isNull()
@@ -638,30 +672,113 @@ class PreviewCanvas(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(28, 28, 30))
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        self._banner_rect = QRectF()
+        self._paint_backdrop(painter)
         if self._pixmap is None or self._pixmap.isNull():
-            painter.setPen(QColor(150, 150, 155))
-            painter.drawText(self.rect(), Qt.AlignCenter, self._placeholder)
-            painter.end()
-            return
-        rect = self.display_rect()
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
-        if self._tool and self._frame_full:
-            self._paint_crop_overlay(painter, rect)
-        if self._solo_label:
-            self._paint_banner(painter, rect)
+            self._paint_placeholder(painter)
+        else:
+            rect = self.display_rect()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(theme.color(theme.BORDER_HI), 1.0))
+            painter.drawRect(rect.adjusted(-0.5, -0.5, 0.5, 0.5))
+            if self._tool and self._frame_full:
+                self._paint_crop_overlay(painter, rect)
+            if self._solo_label:
+                self._paint_banner(painter, rect)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(theme.color(theme.BORDER), 1.0))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
         painter.end()
 
+    def _paint_backdrop(self, painter: QPainter) -> None:
+        """Recessed screen: inset fill, soft vignette, registration marks."""
+        r = self.rect()
+        painter.fillRect(r, theme.color(theme.INSET))
+        # Vignette — darkens the corners a touch, like a CRT bezel.
+        radius = max(r.width(), r.height()) * 0.75
+        grad = QRadialGradient(QPointF(r.center()), radius)
+        grad.setColorAt(0.0, QColor(0, 0, 0, 0))
+        grad.setColorAt(0.65, QColor(0, 0, 0, 0))
+        grad.setColorAt(1.0, QColor(0, 0, 0, 90))
+        painter.fillRect(r, grad)
+        # Registration marks: corner brackets + edge-centre ticks.
+        painter.setPen(QPen(theme.color(theme.BORDER_HI, 150), 1.0))
+        m, n = 7.0, 12.0
+        w, h = float(r.width()), float(r.height())
+        for x, sx in ((m, 1), (w - m, -1)):
+            for y, sy in ((m, 1), (h - m, -1)):
+                painter.drawLine(QPointF(x, y), QPointF(x + sx * n, y))
+                painter.drawLine(QPointF(x, y), QPointF(x, y + sy * n))
+        t = 5.0
+        painter.drawLine(QPointF(w / 2, 1), QPointF(w / 2, 1 + t))
+        painter.drawLine(QPointF(w / 2, h - 1), QPointF(w / 2, h - 1 - t))
+        painter.drawLine(QPointF(1, h / 2), QPointF(1 + t, h / 2))
+        painter.drawLine(QPointF(w - 1, h / 2), QPointF(w - 1 - t, h / 2))
+
+    def _paint_placeholder(self, painter: QPainter) -> None:
+        """Centred glyph + dim text (>= 13 px)."""
+        muted = self._placeholder == MUTE_PLACEHOLDER_TEXT
+        font = theme.label_font(13)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        lines = self._placeholder.split("\n")
+        line_h = metrics.height() + 2
+        glyph = 56.0
+        gap = 16.0
+        total = glyph + gap + line_h * len(lines)
+        top = (self.height() - total) / 2.0
+        cx = self.width() / 2.0
+        self._paint_glyph(painter, QRectF(cx - glyph / 2, top, glyph, glyph), muted)
+        painter.setPen(theme.color(theme.TEXT_DIM))
+        y = top + glyph + gap
+        for k, line in enumerate(lines):
+            f = QFont(font)
+            if k == 0:
+                f.setBold(True)
+            painter.setFont(f)
+            painter.drawText(
+                QRectF(0, y, self.width(), line_h), Qt.AlignHCenter | Qt.AlignVCenter, line
+            )
+            y += line_h
+
+    @staticmethod
+    def _paint_glyph(painter: QPainter, box: QRectF, muted: bool) -> None:
+        """Icon-like glyph: two stacked frames (layers); with a slash when the
+        placeholder is about muted images."""
+        pen = QPen(theme.color(theme.TEXT_DIM), 2.0)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        back = QRectF(box.left() + 10, box.top() + 4, box.width() - 14, box.height() - 18)
+        front = QRectF(box.left() + 2, box.top() + 14, box.width() - 14, box.height() - 18)
+        painter.drawRoundedRect(back, 4, 4)
+        painter.setBrush(theme.color(theme.INSET))
+        painter.drawRoundedRect(front, 4, 4)
+        painter.setBrush(Qt.NoBrush)
+        if muted:
+            painter.setPen(QPen(theme.color(theme.PURPLE[0]), 4.0, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(box.left() + 2, box.bottom() - 2),
+                             QPointF(box.right() - 2, box.top() + 2))
+        else:
+            c = front.center()
+            painter.setPen(QPen(theme.color(theme.GOLD[0]), 2.5, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(c.x() - 6, c.y()), QPointF(c.x() + 6, c.y()))
+            painter.drawLine(QPointF(c.x(), c.y() - 6), QPointF(c.x(), c.y() + 6))
+
     def _paint_crop_overlay(self, painter: QPainter, rect: QRectF) -> None:
+        gold = theme.color(theme.GOLD[0])
         if self._editor is not None:
             crop = self._editor.crop
-            dim = 150
+            dim = 140  # ~55 % black outside the crop
         elif self._applied_crop is not None and not canvas_tools.is_full_crop(
             self._applied_crop
         ):
             crop = self._applied_crop
-            dim = 70  # an applied crop: only lightly dimmed
+            dim = 90  # an applied crop: lighter dimming
         else:
             return
         x0, y0, x1, y1 = crop
@@ -675,47 +792,51 @@ class PreviewCanvas(QWidget):
         inner.addRect(box)
         painter.fillPath(outside.subtracted(inner), QColor(0, 0, 0, dim))
         painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(255, 255, 255, 230), 1.0))
-        painter.drawRect(box)
+        painter.setRenderHint(QPainter.Antialiasing, False)
         if self._editor is None:
+            # Applied crop (tool on, not editing): dashed gold outline.
+            pen = QPen(gold, 1.5, Qt.DashLine)
+            pen.setDashPattern([5.0, 3.0])
+            painter.setPen(pen)
+            painter.drawRect(box)
+            painter.setRenderHint(QPainter.Antialiasing, True)
             return
-        # Rule-of-thirds guides.
-        painter.setPen(QPen(QColor(255, 255, 255, 110), 1.0))
+        painter.setPen(QPen(gold, 1.5))
+        painter.drawRect(box)
+        # Rule-of-thirds guides (translucent text colour).
+        painter.setPen(QPen(theme.color(theme.TEXT, 100), 1.0))
         for k in (1, 2):
             gx = box.left() + box.width() * k / 3.0
             gy = box.top() + box.height() * k / 3.0
             painter.drawLine(QPointF(gx, box.top()), QPointF(gx, box.bottom()))
             painter.drawLine(QPointF(box.left(), gy), QPointF(box.right(), gy))
-        # Handles: 4 corners + 4 edge midpoints.
-        painter.setPen(QPen(QColor(20, 20, 20, 220), 1.0))
-        painter.setBrush(QColor(255, 255, 255))
+        # Handles: 4 corners + 4 edge midpoints — gold squares, dark outline.
+        painter.setPen(QPen(theme.color(theme.INSET), 1.5))
+        painter.setBrush(gold)
         half = 4.5
         for name in canvas_tools.HANDLES:
             p = self._editor.handle_point(name, rect)
             painter.drawRect(QRectF(p.x() - half, p.y() - half, 2 * half, 2 * half))
+        painter.setRenderHint(QPainter.Antialiasing, True)
 
     def _paint_banner(self, painter: QPainter, rect: QRectF) -> None:
-        font = QFont(painter.font())
-        font.setBold(True)
-        font.setPointSizeF(max(font.pointSizeF(), 10.5))
+        """Gold pill: "SOLO — filename" in dark text."""
+        font = theme.label_font(11, bold=True)
         painter.setFont(font)
         metrics = painter.fontMetrics()
         text = metrics.elidedText(
-            self._solo_label or "", Qt.ElideMiddle, max(60, int(rect.width()) - 40)
+            self._solo_label or "", Qt.ElideMiddle, max(60, int(rect.width()) - 56)
         )
-        pad_x, pad_y = 10, 5
+        pad_x = 14
         box = QRectF(
             rect.left() + 10,
             rect.top() + 10,
             metrics.horizontalAdvance(text) + 2 * pad_x,
-            metrics.height() + 2 * pad_y,
+            metrics.height() + 10,
         )
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 150))
-        painter.drawRoundedRect(box, 6, 6)
-        painter.setBrush(_ACCENT)
-        painter.drawRoundedRect(QRectF(box.left(), box.top(), 4, box.height()), 2, 2)
-        painter.setPen(QColor(255, 255, 255))
-        painter.drawText(
-            box.adjusted(pad_x + 2, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, text
-        )
+        self._banner_rect = box
+        painter.setPen(QPen(theme.color(theme.GOLD[1]), 1.0))
+        painter.setBrush(theme.color(theme.GOLD[0]))
+        painter.drawRoundedRect(box, box.height() / 2, box.height() / 2)
+        painter.setPen(theme.color(theme.TEXT_ON_GOLD))
+        painter.drawText(box, Qt.AlignCenter, text)

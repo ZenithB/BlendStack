@@ -18,6 +18,9 @@ every change so the UI and the preview controller can react:
   crop is ``None`` or ``(x0, y0, x1, y1)`` fractions of the FULL canvas and
   is part of the document (presets, export).
 
+Mute (``Adjustments.mute``, edited through :meth:`DocumentState.set_mute`)
+removes an image from the blend while it still sizes the canvas.
+
 Layer placement (move) lives in each entry's
 :class:`~blendstack.core.adjustments.Adjustments` (``move_x`` / ``move_y``,
 fractions of the canvas) and is edited through :meth:`set_placement`.
@@ -244,6 +247,32 @@ class DocumentState(QObject):
         if entry_id != self._solo_id:
             self._solo_id = entry_id
             self.solo_changed.emit(entry_id)
+
+    # -- mute ---------------------------------------------------------------------
+
+    def set_mute(self, entry_id: int, muted: bool) -> None:
+        """Mute / un-mute one image.  A muted image is left out of the blend
+        (it still sizes the canvas).  Goes through :meth:`set_adjustments`, so
+        :attr:`adjustments_changed` fires; ``mute`` is not part of
+        ``adjust_key()``, so only the fold re-runs."""
+        entry = self.entry(entry_id)
+        if entry is not None:
+            self.set_adjustments(
+                entry_id, replace(entry.adjustments, mute=bool(muted))
+            )
+
+    def toggle_mute(self, entry_id: int) -> None:
+        entry = self.entry(entry_id)
+        if entry is not None:
+            self.set_mute(entry_id, not entry.adjustments.mute)
+
+    def is_muted(self, entry_id: int) -> bool:
+        entry = self.entry(entry_id)
+        return entry is not None and entry.adjustments.mute
+
+    def unmuted_count(self) -> int:
+        """How many images take part in the blend."""
+        return sum(1 for e in self._entries if not e.adjustments.mute)
 
     # -- canvas crop ----------------------------------------------------------------
 

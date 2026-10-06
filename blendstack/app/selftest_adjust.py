@@ -1,4 +1,5 @@
-"""Offscreen checks for the adjustments panel, curve editor and order panel.
+"""Offscreen checks for the knob, adjustments panel, blend controls, curve editor,
+order panel and histogram.
 
 Run with::
 
@@ -16,7 +17,7 @@ from dataclasses import fields, replace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QModelIndex, QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QMouseEvent  # noqa: E402
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QWheelEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -26,8 +27,18 @@ from blendstack.core.adjustments import (  # noqa: E402
     STAGES,
     Adjustments,
 )
+from blendstack.app import theme  # noqa: E402
+from blendstack.app import adjustments_panel as _m_panel  # noqa: E402
+from blendstack.app import blend_controls as _m_blend  # noqa: E402
+from blendstack.app import curve_editor as _m_curve  # noqa: E402
+from blendstack.app import histogram as _m_hist  # noqa: E402
+from blendstack.app import knob as _m_knob  # noqa: E402
+from blendstack.app import order_panel as _m_order  # noqa: E402
 from blendstack.app.adjustments_panel import AdjustmentsPanel  # noqa: E402
+from blendstack.app.blend_controls import BlendControls  # noqa: E402
 from blendstack.app.curve_editor import HIT_RADIUS, MIN_X_GAP, CurveEditor  # noqa: E402
+from blendstack.app.histogram import HistogramWidget  # noqa: E402
+from blendstack.app.knob import Knob  # noqa: E402
 from blendstack.app.order_panel import OrderPanel  # noqa: E402
 
 _RESULTS: list[tuple[str, bool, str]] = []
@@ -57,6 +68,7 @@ RICH = Adjustments(
     order=("sharpen", "denoise", "curves", "saturation", "contrast", "exposure"),
     move_x=0.125,
     move_y=-0.25,
+    mute=True,
 )
 
 
@@ -79,21 +91,37 @@ def only_changed(a: Adjustments, b: Adjustments) -> set[str]:
 
 # --- mouse helpers (send explicit QMouseEvents so button state is exact) ------
 
-def _ev(kind, widget, pos: QPointF, button, buttons):
+def _ev(kind, widget, pos: QPointF, button, buttons, mods=Qt.NoModifier):
     gp = widget.mapToGlobal(pos)
-    return QMouseEvent(kind, pos, gp, button, buttons, Qt.NoModifier)
+    return QMouseEvent(kind, pos, gp, button, buttons, mods)
 
 
-def press(w, pos, button=Qt.LeftButton):
-    QApplication.sendEvent(w, _ev(QEvent.MouseButtonPress, w, pos, button, button))
+def press(w, pos, button=Qt.LeftButton, mods=Qt.NoModifier):
+    QApplication.sendEvent(w, _ev(QEvent.MouseButtonPress, w, pos, button, button, mods))
 
 
-def move(w, pos, buttons=Qt.LeftButton):
-    QApplication.sendEvent(w, _ev(QEvent.MouseMove, w, pos, Qt.NoButton, buttons))
+def move(w, pos, buttons=Qt.LeftButton, mods=Qt.NoModifier):
+    QApplication.sendEvent(w, _ev(QEvent.MouseMove, w, pos, Qt.NoButton, buttons, mods))
 
 
-def release(w, pos, button=Qt.LeftButton):
-    QApplication.sendEvent(w, _ev(QEvent.MouseButtonRelease, w, pos, button, Qt.NoButton))
+def release(w, pos, button=Qt.LeftButton, mods=Qt.NoModifier):
+    QApplication.sendEvent(w, _ev(QEvent.MouseButtonRelease, w, pos, button, Qt.NoButton, mods))
+
+
+def dblclick(w, pos, button=Qt.LeftButton):
+    QApplication.sendEvent(w, _ev(QEvent.MouseButtonDblClick, w, pos, button, button))
+
+
+def wheel(w, dy: int, mods=Qt.NoModifier):
+    pos = QPointF(w.width() / 2, w.height() / 2)
+    ev = QWheelEvent(pos, w.mapToGlobal(pos), QPoint(0, 0), QPoint(0, dy),
+                     Qt.NoButton, mods, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(w, ev)
+
+
+def key(w, k, mods=Qt.NoModifier):
+    QApplication.sendEvent(w, QKeyEvent(QEvent.KeyPress, k, mods))
+    QApplication.sendEvent(w, QKeyEvent(QEvent.KeyRelease, k, mods))
 
 
 def px(plot, x, y) -> QPointF:
@@ -122,7 +150,7 @@ def test_panel(app: QApplication) -> None:
     panel.set_values(RICH)
     check("repeated set_values emits nothing", rec.count == 0)
 
-    # off-grid values survive (not re-quantised by the sliders)
+    # off-grid values survive (not re-quantised by the knobs)
     odd = replace(RICH, exposure=0.123, contrast=-12.5, denoise=33.3)
     panel.set_values(odd)
     check("off-grid values preserved by values()",
@@ -130,7 +158,7 @@ def test_panel(app: QApplication) -> None:
           and panel.values().denoise == 33.3)
     panel.set_values(RICH)
 
-    # each slider edit changes only its field, placement preserved
+    # each knob edit changes only its field, placement + mute preserved
     edits = {
         "denoise_row": ("denoise", 77, 77.0),
         "radius_row": ("sharpen_radius", 200, 20.0),
@@ -143,7 +171,7 @@ def test_panel(app: QApplication) -> None:
     for row_name, (field, raw, expect) in edits.items():
         panel.set_values(RICH)
         rec.clear()
-        getattr(panel, row_name).slider.setValue(raw)
+        getattr(panel, row_name).set_raw_from_user(raw)
         ok = rec.count == 1
         a = rec.args[-1][0] if rec.args else None
         check(f"{row_name} emits exactly once", ok, f"count={rec.count}")
@@ -153,22 +181,31 @@ def test_panel(app: QApplication) -> None:
                   f"changed={only_changed(a, RICH)}")
             check(f"{row_name}: value {expect}",
                   abs(getattr(a, field) - expect) < 1e-9, f"{getattr(a, field)}")
-            check(f"{row_name}: move_x/move_y preserved",
-                  (a.move_x, a.move_y) == (RICH.move_x, RICH.move_y))
+            check(f"{row_name}: move_x/move_y/mute preserved",
+                  (a.move_x, a.move_y, a.mute) == (RICH.move_x, RICH.move_y, RICH.mute))
     panel.set_values(RICH)
-    check("sharpen radius slider min 0.5 / max 20.0",
-          abs(panel.radius_row.slider.minimum() * 0.1 - 0.5) < 1e-9
-          and abs(panel.radius_row.slider.maximum() * 0.1 - 20.0) < 1e-9)
-    check("noise slider range 0..100",
-          (panel.denoise_row.slider.minimum(), panel.denoise_row.slider.maximum()) == (0, 100))
+    check("sharpen radius knob min 0.5 / max 20.0",
+          abs(panel.radius_row.minimum() * 0.1 - 0.5) < 1e-9
+          and abs(panel.radius_row.maximum() * 0.1 - 20.0) < 1e-9)
+    check("noise knob range 0..100",
+          (panel.denoise_row.minimum(), panel.denoise_row.maximum()) == (0, 100))
+    check("panel knobs are Knob instances",
+          all(isinstance(getattr(panel, n), Knob) for n in edits))
 
     # placement survives a chain of edits and an emitted-state echo
     panel.set_values(RICH)
     rec.clear()
-    panel.contrast_row.slider.setValue(10)
-    panel.amount_row.slider.setValue(20)
-    check("placement preserved across consecutive edits",
-          rec.args[-1][0].move_x == 0.125 and rec.args[-1][0].move_y == -0.25)
+    panel.contrast_row.set_raw_from_user(10)
+    panel.amount_row.set_raw_from_user(20)
+    check("placement + mute preserved across consecutive edits",
+          rec.args[-1][0].move_x == 0.125 and rec.args[-1][0].move_y == -0.25
+          and rec.args[-1][0].mute is True)
+    # mute / placement set from outside (state echo) survive later edits
+    panel.set_values(replace(RICH, mute=False, move_x=0.5))
+    rec.clear()
+    panel.contrast_row.set_raw_from_user(-33)
+    check("echoed mute/move survive an edit",
+          rec.args[-1][0].mute is False and rec.args[-1][0].move_x == 0.5)
 
     # reset keeps placement, restores the rest
     panel.set_values(RICH)
@@ -176,8 +213,8 @@ def test_panel(app: QApplication) -> None:
     panel.reset()
     a = rec.args[-1][0] if rec.args else None
     check("reset() emits once", rec.count == 1)
-    expect = replace(Adjustments(), move_x=0.125, move_y=-0.25)
-    check("reset() restores defaults, keeps move_x/move_y", a == expect,
+    expect = replace(Adjustments(), move_x=0.125, move_y=-0.25, mute=True)
+    check("reset() restores defaults, keeps move_x/move_y/mute", a == expect,
           f"diff={only_changed(a, expect) if a else None}")
     check("reset(): curves identity, order default, opacity 100, denoise 0",
           a is not None and a.curve_master == ID and a.curve_red == ID
@@ -228,7 +265,7 @@ def test_panel(app: QApplication) -> None:
     states = {op.row_item(i).data(Qt.UserRole): op.row_item(i).font().italic()
               for i in range(op.list.count())}
     check("identity adjustments: all stages dimmed", all(states.values()), str(states))
-    panel.denoise_row.slider.setValue(30)
+    panel.denoise_row.set_raw_from_user(30)
     states = {op.row_item(i).data(Qt.UserRole): op.row_item(i).font().italic()
               for i in range(op.list.count())}
     check("dimming updates after edit (denoise active, others dim)",
@@ -239,47 +276,53 @@ def test_panel(app: QApplication) -> None:
               for i in range(op.list.count())}
     check("dimming after set_values: all stages active", not any(states.values()), str(states))
 
-    # width fits the 330 px right column
-    w = panel.minimumSizeHint().width()
-    check("panel minimumSizeHint().width() <= 300", w <= 300, f"{w}")
-    # embedded in a scroll area (as in the main window) the panel's height
-    # must not force a tall minimum on its host
-    from PySide6.QtWidgets import QScrollArea, QWidget, QVBoxLayout
+    # disabled panel stays rendered/readable; enabling works
+    panel.setEnabled(False)
+    check("panel can be disabled (before an image is selected)", not panel.exposure_row.isEnabled())
+    panel.setEnabled(True)
 
-    host = QWidget()
-    hl = QVBoxLayout(host)
-    hl.setContentsMargins(0, 0, 0, 0)
-    sc = QScrollArea()
-    sc.setWidgetResizable(True)
-    sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    inner = AdjustmentsPanel()
-    inner.setEnabled(True)
-    sc.setWidget(inner)
-    hl.addWidget(sc)
-    host.setFixedWidth(330)
-    host.resize(330, 400)
-    host.show()
+    # compact mode shrinks the dials and the plot but keeps every contract
+    h_norm = panel.sizeHint().height()
+    panel.set_compact(True)
+    check("compact mode: dials + plot shrink",
+          panel.exposure_row.dial_size() == Knob.COMPACT
+          and panel.curve_editor.plot.width() < 170 and panel.is_compact())
+    panel.set_values(RICH)
+    check("compact mode: round-trip still exact", panel.values() == RICH)
+    panel.set_compact(False)
+    check("normal mode restored", panel.exposure_row.dial_size() == Knob.NORMAL)
+    # width-driven automatic compact mode (hysteresis-free: depends only on width)
+    auto = AdjustmentsPanel()
+    auto.show()
+    auto.resize(auto.minimumSizeHint().width(), 250)
     app.processEvents()
-    check("scroll-hosted panel: host minimum height stays small",
-          host.minimumSizeHint().height() < 300, f"{host.minimumSizeHint().height()}")
-    check("scroll-hosted panel: no horizontal overflow",
-          inner.width() <= sc.viewport().width()
-          and not sc.horizontalScrollBar().isVisible())
-    check("panel has no explicit min/max height set",
-          panel.maximumHeight() > 10000 and inner.curve_editor.minimumHeight() == 0)
-    host.close()
+    narrow = auto.is_compact()
+    auto.resize(auto.sizeHint().width() + 20, 250)
+    app.processEvents()
+    wide = auto.is_compact()
+    check("panel goes compact when narrower than its preferred width, normal when wide",
+          narrow and not wide, f"narrow={narrow} wide={wide}")
+    check("compact hint is shorter than the normal hint",
+          auto.minimumSizeHint().height() < auto.sizeHint().height()
+          and auto.minimumSizeHint().width() <= auto.sizeHint().width())
+    auto.close()
+    check("panel has no explicit min/max height set", panel.maximumHeight() > 10000
+          and h_norm == panel.sizeHint().height())
+    check("panel does not use a scroll area",
+          not panel.findChildren(__import__("PySide6.QtWidgets", fromlist=["QScrollArea"]).QScrollArea))
     panel.close()
 
 
 def test_curve_editor(app: QApplication) -> None:
     ed = CurveEditor()
-    ed.resize(280, 400)
     ed.show()
     app.processEvents()
     rec = Recorder(ed.curves_changed)
     plot = ed.plot
-    check("plot is square (heightForWidth)", plot.heightForWidth(250) == 250)
-    check("plot min size ~220", plot.minimumSizeHint().width() >= 200)
+    check("plot is square", plot.width() == plot.height())
+    check("plot is compact (160..176 px)", 160 <= plot.width() <= 176, f"{plot.width()}")
+    check("plot drawing area ~160 px", 150 <= plot.plot_rect().width() <= 170,
+          f"{plot.plot_rect().width()}")
     check("initial curves identity", ed.curves() == (ID, ID, ID, ID))
 
     # API: add / move / remove
@@ -416,8 +459,7 @@ def test_curve_editor(app: QApplication) -> None:
     check("hover over a point -> pointing-hand cursor",
           plot.cursor().shape() == Qt.PointingHandCursor)
     check("hover readout shows in -> out in 0-255",
-          "In 128" in ed._readout.text() and "Out 128" in ed._readout.text(),
-          ed._readout.text())
+          ed._readout.text().count("128") == 2, ed._readout.text())
     move(plot, px(plot, 0.2, 0.8), Qt.NoButton)
     check("hover off a point -> cross cursor", plot.cursor().shape() == Qt.CrossCursor)
 
@@ -502,14 +544,14 @@ def test_order_panel(app: QApplication) -> None:
     rec = Recorder(op.order_changed)
     check("default order", op.order() == DEFAULT_ORDER)
     labels = [op.row_item(i).text() for i in range(op.list.count())]
-    check("rows listed with handle glyph and labels",
-          [t.split("  ", 1)[1] for t in labels]
-          == ["Exposure", "Contrast", "Curves", "Saturation", "Noise removal", "Sharpen"]
-          and all(t.startswith("⋮⋮") for t in labels), str(labels))
+    check("rows listed with their labels",
+          labels == ["Exposure", "Contrast", "Curves", "Saturation", "Noise removal", "Sharpen"],
+          str(labels))
+    check("chip rows are ~20 px high", all(
+        op.row_item(i).sizeHint().height() == 20 for i in range(6)))
     check("ids stored in UserRole",
           tuple(op.row_item(i).data(Qt.UserRole) for i in range(6)) == STAGES)
-    check("title text", "Processing order" in op.title_label.text()
-          and "drag to reorder" in op.title_label.text())
+    check("hint text", "drag to reorder" in op.title_label.text())
 
     op.move_item(0, 3)
     exp = list(DEFAULT_ORDER)
@@ -590,11 +632,373 @@ def test_order_panel(app: QApplication) -> None:
     op.close()
 
 
+def _knob_center(k: Knob) -> QPointF:
+    return QPointF(k.width() / 2.0, k._TOP + k.dial_size() / 2.0)
+
+
+def _drag(k: Knob, dy: float = 0.0, dx: float = 0.0, mods=Qt.NoModifier, steps: int = 5) -> None:
+    """Press on the dial, move in ``steps`` increments, release."""
+    c = _knob_center(k)
+    press(k, c, mods=mods)
+    for i in range(1, steps + 1):
+        move(k, QPointF(c.x() + dx * i / steps, c.y() + dy * i / steps), mods=mods)
+    release(k, QPointF(c.x() + dx, c.y() + dy), mods=mods)
+
+
+def test_knob(app: QApplication) -> None:
+    exp = Knob("EXPOSURE", -300, 300, scale=0.01, decimals=2, suffix=" EV")
+    rad = Knob("SHARPEN RADIUS", 5, 200, scale=0.1, decimals=1, suffix=" px", default=1.0)
+    opa = Knob("OPACITY", 0, 100, suffix=" %", default=100.0)
+    soft = Knob("SOFTNESS", 0, 100)
+    bias = Knob("BIAS", -100, 100)
+    for k in (exp, rad, opa, soft, bias):
+        k.show()
+    app.processEvents()
+
+    # raw <-> real mapping -----------------------------------------------------
+    exp.set_raw(-300)
+    check("exposure raw -300 -> -3.00 EV", exp.value() == -3.0 and exp.raw() == -300)
+    exp.set_raw(300)
+    check("exposure raw 300 -> +3.00 EV", exp.value() == 3.0)
+    exp.set_value(0.57)
+    check("exposure 0.57 -> raw 57 -> 0.57 (clean float)", exp.raw() == 57 and exp.value() == 0.57,
+          f"{exp.raw()} {exp.value()!r}")
+    check("exposure matches() lands on the step",
+          exp.matches(0.57) and exp.matches(0.5700001) and not exp.matches(0.58))
+    exp.set_value(9.0)
+    check("exposure set_value clamps to +3", exp.value() == 3.0)
+    exp.set_value(-9.0)
+    check("exposure set_value clamps to -3", exp.value() == -3.0)
+    exp.set_value(float("nan"))
+    check("NaN is ignored", exp.value() == -3.0)
+    exp.set_value(0.5)
+    check("exposure readout '+0.50 EV'", exp.format_value() == "+0.50 EV", exp.format_value())
+    exp.set_value(0.0)
+    check("zero readout has no minus sign", exp.format_value() == "+0.00 EV", exp.format_value())
+    check("radius range 0.5..20.0 (raw 5..200)",
+          rad.minimum() == 5 and rad.maximum() == 200
+          and abs(rad.minimum() * rad.scale() - 0.5) < 1e-9
+          and abs(rad.maximum() * rad.scale() - 20.0) < 1e-9)
+    rad.set_value(12.5)
+    check("radius 12.5 -> raw 125", rad.raw() == 125 and rad.value() == 12.5)
+    rad.set_raw(30)
+    check("radius raw 30 -> exactly 3.0", rad.value() == 3.0, repr(rad.value()))
+    rad.set_value(0.1)
+    check("radius clamps to 0.5", rad.value() == 0.5)
+    rad.set_value(99.0)
+    check("radius clamps to 20.0", rad.value() == 20.0)
+    check("radius readout '12.5 px'", (rad.set_value(12.5), rad.format_value())[1] == "12.5 px")
+    opa.set_value(60.0)
+    check("opacity 60 -> '60 %' unsigned", opa.value() == 60.0 and opa.format_value() == "60 %")
+    bias.set_value(-20)
+    check("bias readout signed '-20'", bias.format_value() == "-20", bias.format_value())
+
+    # bipolar / unipolar / default ------------------------------------------------
+    check("bipolar flag: exposure/bias yes; opacity/softness/radius no",
+          exp.is_bipolar() and bias.is_bipolar()
+          and not opa.is_bipolar() and not soft.is_bipolar() and not rad.is_bipolar())
+    check("default: spanning range -> 0; unipolar -> minimum; explicit wins",
+          exp.default() == 0.0 and bias.default() == 0.0 and soft.default() == 0.0
+          and rad.default() == 1.0 and opa.default() == 100.0
+          and Knob("R", 5, 200, scale=0.1).default() == 0.5)
+    check("fresh knob starts at 0 / minimum",
+          Knob("E", -300, 300, scale=0.01).value() == 0.0 and Knob("R", 5, 200, scale=0.1).value() == 0.5)
+
+    # silent vs user ------------------------------------------------------------
+    rec = Recorder(exp.valueChanged)
+    exp.set_value(1.25)
+    exp.set_raw(10)
+    check("set_value / set_raw are silent", rec.count == 0)
+    exp.set_value_from_user(1.5)
+    check("set_value_from_user emits exactly once, in real units",
+          rec.count == 1 and rec.args[0] == (1.5,) and exp.value() == 1.5, str(rec.args))
+    exp.set_value_from_user(1.5)
+    check("no change -> no emit", rec.count == 1)
+    exp.set_raw_from_user(-20)
+    check("set_raw_from_user emits real value", rec.count == 2 and rec.args[-1] == (-0.2,),
+          str(rec.args))
+    check("slider shim drives the knob like a user edit",
+          (exp.slider.setValue(40), rec.count == 3 and exp.raw() == 40 and exp.slider.value() == 40
+           and exp.slider.minimum() == -300 and exp.slider.maximum() == 300)[1])
+
+    # tooltip -----------------------------------------------------------------------
+    exp.set_value(0.5)
+    check("tooltip: label, value, reset hint",
+          "EXPOSURE" in exp.toolTip() and "+0.50 EV" in exp.toolTip()
+          and "double-click to reset" in exp.toolTip(), exp.toolTip())
+
+    # drag ---------------------------------------------------------------------------
+    exp.set_value(0.0)
+    rec = Recorder(exp.valueChanged)
+    _drag(exp, dy=-50)  # 50 px up
+    check("drag up raises the value (50 px ~ 1.5 EV)",
+          abs(exp.value() - 1.5) < 0.04, f"{exp.value()}")
+    check("drag emits continuously (>1 signal)", rec.count > 1, f"{rec.count}")
+    check("not dragging after release", not exp.is_dragging())
+    exp.set_value(0.0)
+    _drag(exp, dy=+50)
+    check("drag down lowers the value", abs(exp.value() + 1.5) < 0.04, f"{exp.value()}")
+    exp.set_value(0.0)
+    _drag(exp, dx=+30)
+    check("drag right raises the value too", exp.value() > 0.8, f"{exp.value()}")
+    exp.set_value(0.0)
+    _drag(exp, dy=-900)
+    check("drag clamps at the maximum", exp.value() == 3.0, f"{exp.value()}")
+    # clamped accumulator: reversing takes effect immediately
+    c = _knob_center(exp)
+    exp.set_value(0.0)
+    press(exp, c)
+    move(exp, QPointF(c.x(), c.y() - 400))
+    move(exp, QPointF(c.x(), c.y() - 390))   # 10 px back down
+    release(exp, QPointF(c.x(), c.y() - 390))
+    check("reversing after clamping responds immediately (no dead zone)",
+          exp.value() < 3.0, f"{exp.value()}")
+    exp.set_value(0.0)
+    _drag(exp, dy=+900)
+    check("drag clamps at the minimum", exp.value() == -3.0, f"{exp.value()}")
+    # Shift = fine (x0.1)
+    exp.set_value(0.0)
+    _drag(exp, dy=-50, mods=Qt.ShiftModifier)
+    check("Shift-drag is ~10x finer", abs(exp.value() - 0.15) < 0.02, f"{exp.value()}")
+    # integer knob, 200 px for the full range
+    soft.set_value(0)
+    _drag(soft, dy=-100)
+    check("opacity-style knob: 100 px = half range", abs(soft.value() - 50) <= 1, f"{soft.value()}")
+    # right-button press does not drag
+    soft.set_value(10)
+    c = _knob_center(soft)
+    press(soft, c, Qt.RightButton)
+    move(soft, QPointF(c.x(), c.y() - 40), Qt.RightButton)
+    release(soft, c, Qt.RightButton)
+    check("right button does not change the value", soft.value() == 10)
+
+    # wheel -----------------------------------------------------------------------------
+    exp.set_value(0.0)
+    rec = Recorder(exp.valueChanged)
+    wheel(exp, 120)
+    check("wheel up = +1 step", exp.raw() == 1 and rec.count == 1)
+    wheel(exp, -120)
+    wheel(exp, -120)
+    check("wheel down = -1 step each", exp.raw() == -1)
+    wheel(exp, 120, Qt.ShiftModifier)
+    check("Shift+wheel = x10 step", exp.raw() == 9, f"{exp.raw()}")
+    wheel(exp, 40)
+    check("sub-notch wheel delta does not move yet", exp.raw() == 9)
+    soft.set_value(100)
+    wheel(soft, 120)
+    check("wheel clamps at max", soft.value() == 100)
+
+    # keys ---------------------------------------------------------------------------------
+    exp.set_value(0.0)
+    rec = Recorder(exp.valueChanged)
+    key(exp, Qt.Key_Up)
+    key(exp, Qt.Key_Right)
+    check("Up / Right = +1 step", exp.raw() == 2 and rec.count == 2)
+    key(exp, Qt.Key_Down)
+    key(exp, Qt.Key_Left)
+    key(exp, Qt.Key_Left)
+    check("Down / Left = -1 step", exp.raw() == -1)
+    key(exp, Qt.Key_PageUp)
+    check("PageUp = +10 steps", exp.raw() == 9)
+    key(exp, Qt.Key_PageDown)
+    key(exp, Qt.Key_PageDown)
+    check("PageDown = -10 steps", exp.raw() == -11)
+    key(exp, Qt.Key_Home)
+    check("Home = minimum", exp.value() == -3.0)
+    key(exp, Qt.Key_End)
+    check("End = maximum", exp.value() == 3.0)
+    check("focus policy is strong (Tab / click)", exp.focusPolicy() == Qt.StrongFocus)
+
+    # double-click reset ---------------------------------------------------------------------
+    opa.set_value(40.0)
+    rec = Recorder(opa.valueChanged)
+    c = _knob_center(opa)
+    press(opa, c)
+    release(opa, c)
+    dblclick(opa, c)
+    release(opa, c)
+    check("double-click resets to the default (opacity -> 100) and emits once",
+          opa.value() == 100.0 and rec.count == 1 and rec.args[0] == (100.0,), str(rec.args))
+    c = _knob_center(exp)
+    exp.set_value(1.0)
+    dblclick(exp, c)
+    check("double-click resets exposure to 0", exp.value() == 0.0)
+    rec = Recorder(exp.valueChanged)
+    exp.reset()
+    check("reset() at default emits nothing", rec.count == 0)
+    rad.set_value(8.0)
+    rad.reset()
+    check("reset() radius -> 1.0", rad.value() == 1.0)
+
+    # rendering never crashes, enabled / disabled / focused / dragging ------------------------
+    ok = True
+    for k in (exp, rad, opa, soft, bias):
+        for state in ("normal", "disabled", "focus", "compact"):
+            k.setEnabled(state != "disabled")
+            if state == "focus":
+                k.setFocus(Qt.TabFocusReason)
+            if state == "compact":
+                k.set_dial_size(Knob.COMPACT)
+            ok &= not k.grab().isNull()
+        k.set_dial_size(Knob.NORMAL)
+        k.setEnabled(True)
+    check("knobs render in every state", ok)
+    sh = exp.sizeHint()
+    check("knob sizeHint ~ (dial+14.., dial+34)",
+          sh.height() == Knob.NORMAL + 34 and sh.width() >= Knob.NORMAL + 14, f"{sh}")
+    exp.set_dial_size(Knob.COMPACT)
+    check("compact knob is shorter", exp.sizeHint().height() == Knob.COMPACT + 34)
+    check("Knob.COMPACT < Knob.NORMAL", Knob.COMPACT < Knob.NORMAL and Knob.NORMAL >= 52)
+    for k in (exp, rad, opa, soft, bias):
+        k.close()
+
+
+def test_blend(app: QApplication) -> None:
+    bc = BlendControls()
+    bc.show()
+    app.processEvents()
+    modes = Recorder(bc.mode_changed)
+    params = Recorder(bc.param_changed)
+
+    bc.set_from_state("canon_bright", {"softness": 30.0, "bias": -20.0, "basis": "luminance"})
+    check("set_from_state emits nothing", modes.count == 0 and params.count == 0)
+    check("set_from_state sets the knobs and the basis pill",
+          bc.softness_row.value() == 30.0 and bc.bias_row.value() == -20.0
+          and bc.luminance_radio.isChecked() and not bc.per_channel_radio.isChecked())
+    check("canon mode shows softness / bias / basis, hides the hint",
+          bc.softness_row.isVisible() and bc.bias_row.isVisible() and bc.basis_row.isVisible()
+          and not bc.hint_label.isVisible())
+    bc.set_from_state("multiply", {})
+    check("continuous mode hides softness / bias / basis",
+          not bc.softness_row.isVisible() and not bc.bias_row.isVisible()
+          and not bc.basis_row.isVisible())
+    check("continuous mode shows the dim hint", bc.hint_label.isVisible()
+          and "opacity" in bc.hint_label.text().lower())
+    check("mode combo shows only the mode (still visible)", bc.mode_combo.isVisible())
+    for name in ("average", "screen", "grain_merge", "overlay"):
+        bc.set_from_state(name, {})
+        if bc.softness_row.isVisible() or bc.basis_row.isVisible():
+            check(f"mode {name} hides parameter widgets", False)
+            break
+    else:
+        check("all 5 continuous modes hide parameter widgets", True)
+    bc.set_from_state("canon_dark", {})
+    check("canon_dark shows them again", bc.softness_row.isVisible() and bc.bias_row.isVisible()
+          and bc.basis_row.isVisible())
+    check("basis defaults to per-channel", bc.per_channel_radio.isChecked())
+
+    # signals
+    bc.softness_row.set_raw_from_user(45)
+    check("softness knob -> param_changed('softness', 45.0)",
+          params.args[-1] == ("softness", 45.0), str(params.args))
+    bc.bias_row.set_raw_from_user(-70)
+    check("bias knob -> param_changed('bias', -70.0)", params.args[-1] == ("bias", -70.0))
+    params.clear()
+    QTest.mouseClick(bc.luminance_radio, Qt.LeftButton)
+    check("LUMA pill -> param_changed('basis', 'luminance') once",
+          params.count == 1 and params.args[0] == ("basis", "luminance"), str(params.args))
+    check("LUMA is checked, PER-CH is not",
+          bc.luminance_radio.isChecked() and not bc.per_channel_radio.isChecked())
+    params.clear()
+    QTest.mouseClick(bc.per_channel_radio, Qt.LeftButton)
+    check("PER-CH pill -> param_changed('basis', 'per_channel') once",
+          params.count == 1 and params.args[0] == ("basis", "per_channel"))
+    params.clear()
+    bc.luminance_radio.setChecked(True)
+    check("radio shim: setChecked(True) emits basis once", params.args == [("basis", "luminance")])
+    bc.per_channel_radio.setChecked(True)
+    got: list = []
+    bc.per_channel_radio.toggled.connect(got.append)
+    bc.luminance_radio.setChecked(True)
+    check("radio shim: toggled signal fires", got == [False])
+    check("basis pill is exclusive", [bc.per_channel_radio.isChecked(),
+                                      bc.luminance_radio.isChecked()] == [False, True])
+    # mode combo
+    modes.clear()
+    bc.mode_combo.setCurrentIndex(bc.mode_combo.findData("average"))
+    check("mode combo emits mode_changed(name)", modes.args == [("average",)], str(modes.args))
+    check("combo items carry registry names", bc.mode_combo.findData("canon_bright") >= 0)
+    # knob defaults
+    bc.softness_row.set_value(50)
+    bc.softness_row.reset()
+    check("softness double-click default = 0", bc.softness_row.value() == 0.0)
+    bc.set_compact(True)
+    check("blend compact mode shrinks knobs", bc.softness_row.dial_size() == Knob.COMPACT)
+    bc.set_compact(False)
+    check("blend grab renders", not bc.grab().isNull())
+    bc.close()
+
+
+def test_histogram(app: QApplication) -> None:
+    import numpy as np
+
+    h = HistogramWidget()
+    h.show()
+    check("empty histogram has no data", not h.has_data())
+    check("empty histogram renders", not h.grab().isNull())
+    x = np.arange(256)
+    data = np.stack([np.exp(-((x - m) / 40.0) ** 2) * 1000 for m in (80, 110, 150, 120)]).astype(int)
+    h.set_data(data)
+    check("histogram has data", h.has_data() and not h.grab().isNull())
+    try:
+        h.set_data(np.zeros((3, 256)))
+        bad = False
+    except ValueError:
+        bad = True
+    check("wrong-shaped histogram is rejected", bad)
+    h.set_data(None)
+    check("set_data(None) clears", not h.has_data())
+    h.close()
+
+
+def test_sizes_and_contrast(app: QApplication) -> None:
+    ap = AdjustmentsPanel().sizeHint()
+    check("AdjustmentsPanel sizeHint height <= 250", ap.height() <= 250, f"{ap}")
+    check("AdjustmentsPanel sizeHint width <= 840", ap.width() <= 840, f"{ap}")
+    check("AdjustmentsPanel minimumSizeHint <= sizeHint",
+          AdjustmentsPanel().minimumSizeHint().width() <= ap.width()
+          and AdjustmentsPanel().minimumSizeHint().height() <= ap.height())
+    bc = BlendControls().sizeHint()
+    check("BlendControls sizeHint <= 210 x 240", bc.width() <= 210 and bc.height() <= 240, f"{bc}")
+    hs = HistogramWidget()
+    check("HistogramWidget sizeHint ~ 200x100",
+          (hs.sizeHint().width(), hs.sizeHint().height()) == (200, 100), f"{hs.sizeHint()}")
+    check("HistogramWidget imposes no large minimum height",
+          hs.minimumSizeHint().height() <= 60 and hs.minimumHeight() == 0)
+    # at 1280 the three fit at their preferred sizes; at 1200 they fit at their
+    # minimum sizes (the histogram flexes), with 10 px gutters/spacing
+    total = bc.width() + ap.width() + hs.sizeHint().width() + 4 * 10
+    check("rack fits 1280 px wide at preferred sizes", total <= 1280, f"{total}")
+    small = (BlendControls().minimumSizeHint().width() + AdjustmentsPanel().minimumSizeHint().width()
+             + hs.minimumSizeHint().width() + 4 * 10)
+    check("rack fits 1200 px wide at minimum sizes", small <= 1200, f"{small}")
+
+    # every foreground/background pair hard-wired in these widgets >= 4.5:1
+    pairs = []
+    for mod in (_m_knob, _m_panel if hasattr(_m_panel, "contrast_pairs") else None,
+                _m_blend, _m_curve, _m_order, _m_hist):
+        if mod is not None and hasattr(mod, "contrast_pairs"):
+            pairs.extend(mod.contrast_pairs())
+    check("contrast pairs were collected from every widget module", len(pairs) >= 25, f"{len(pairs)}")
+    for name, fg, bg in pairs:
+        r = theme.contrast_ratio(fg, bg)
+        check(f"contrast >= 4.5: {name}", r >= 4.5, f"{r:.2f}:1 ({fg} on {bg})")
+    # the theme's own guard still holds for the roles used here
+    for name, fg, bg, minimum in theme.text_pairs():
+        r = theme.contrast_ratio(fg, bg)
+        check(f"theme pair {name}", r >= minimum, f"{r:.2f}")
+
+
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
+    theme.apply(app)
+    test_knob(app)
     test_panel(app)
+    test_blend(app)
     test_curve_editor(app)
     test_order_panel(app)
+    test_histogram(app)
+    test_sizes_and_contrast(app)
     failed = [n for n, ok, _ in _RESULTS if not ok]
     print(f"\n{len(_RESULTS) - len(failed)} passed, {len(failed)} failed")
     return 1 if failed else 0

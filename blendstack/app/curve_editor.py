@@ -26,9 +26,8 @@ from typing import Optional, Sequence
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -39,7 +38,10 @@ from PySide6.QtWidgets import (
 
 from blendstack.core.adjustments import IDENTITY_CURVE, curve_lut
 
-__all__ = ["CurveEditor", "CHANNELS", "HIT_RADIUS", "MIN_X_GAP"]
+from . import theme
+from .knob import ghost_button_stylesheet, make_segmented
+
+__all__ = ["CurveEditor", "CHANNELS", "HIT_RADIUS", "MIN_X_GAP", "contrast_pairs"]
 
 #: Channel order == the order of ``curves()`` / ``set_curves()``.
 CHANNELS = ("RGB", "R", "G", "B")
@@ -47,11 +49,27 @@ CHANNELS = ("RGB", "R", "G", "B")
 #: Pixel radius within which the mouse "hits" a control point.
 HIT_RADIUS = 9.0
 #: Drawn control-point radius (px).
-POINT_RADIUS = 5.0
+POINT_RADIUS = 4.5
 #: Minimum x distance between two neighbouring control points.
 MIN_X_GAP = 0.004
 
-_CHANNEL_COLOURS = (None, QColor(225, 60, 60), QColor(50, 175, 70), QColor(70, 120, 235))
+#: Plot edge length (px) in the normal and the compact rack layout.
+PLOT_SIZE = 170
+PLOT_SIZE_COMPACT = 146
+
+_CHANNEL_COLOURS = (theme.GOLD[0], theme.CHANNEL_R, theme.CHANNEL_G, theme.CHANNEL_B)
+
+
+def contrast_pairs() -> list[tuple[str, str, str]]:
+    """(name, foreground, background) pairs hard-wired in this module."""
+    return [
+        ("curve readout idle on panel", theme.TEXT_DIM, theme.PANEL),
+        ("curve readout active on panel", theme.GOLD[0], theme.PANEL),
+        ("curve channel R on plot", theme.CHANNEL_R, theme.INSET),
+        ("curve channel G on plot", theme.CHANNEL_G, theme.INSET),
+        ("curve channel B on plot", theme.CHANNEL_B, theme.INSET),
+        ("curve master on plot", theme.GOLD[0], theme.INSET),
+    ]
 
 _Points = list  # list[tuple[float, float]]
 
@@ -93,32 +111,35 @@ def _is_identity(points: Sequence[Sequence[float]]) -> bool:
 class _CurvePlot(QWidget):
     """The square plot: painting and mouse handling for a CurveEditor."""
 
-    _MARGIN = 10
+    _MARGIN = 5
 
     def __init__(self, editor: "CurveEditor") -> None:
         super().__init__(editor)
         self._editor = editor
         self._drag: Optional[int] = None
         self._hover: Optional[int] = None
+        self._side = PLOT_SIZE
         self.setMouseTracking(True)
         self.setCursor(Qt.CrossCursor)
-        policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        policy.setHeightForWidth(True)
-        self.setSizePolicy(policy)
+        self.setFixedSize(self._side, self._side)
+        self.setToolTip(
+            "Click to add a point \u2022 drag to move it \u2022 "
+            "double-click or right-click a point to remove it"
+        )
 
     # -- geometry ------------------------------------------------------------
 
-    def hasHeightForWidth(self) -> bool:  # noqa: N802
-        return True
-
-    def heightForWidth(self, w: int) -> int:  # noqa: N802
-        return w
+    def set_side(self, side: int) -> None:
+        self._side = int(side)
+        self.setFixedSize(self._side, self._side)
+        self.updateGeometry()
+        self.update()
 
     def sizeHint(self) -> QSize:  # noqa: N802
-        return QSize(260, 260)
+        return QSize(self._side, self._side)
 
     def minimumSizeHint(self) -> QSize:  # noqa: N802
-        return QSize(220, 220)
+        return QSize(self._side, self._side)
 
     def plot_rect(self) -> QRectF:
         m = self._MARGIN
@@ -148,8 +169,7 @@ class _CurvePlot(QWidget):
     # -- painting ------------------------------------------------------------
 
     def _channel_colour(self, ch: int) -> QColor:
-        c = _CHANNEL_COLOURS[ch]
-        return QColor(c) if c is not None else QColor(self.palette().windowText().color())
+        return theme.color(_CHANNEL_COLOURS[ch])
 
     def _curve_path(self, points: Sequence[Sequence[float]]) -> QPainterPath:
         n = 513
@@ -166,30 +186,26 @@ class _CurvePlot(QWidget):
     def paintEvent(self, _event: object) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
-        pal = self.palette()
         r = self.plot_rect()
-        grid = QColor(pal.mid().color())
-        text = QColor(pal.windowText().color())
-
-        p.fillRect(r, pal.base())
-        grid.setAlpha(110)
+        enabled = self.isEnabled()
+        # recessed display
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.color(theme.INSET))
+        p.drawRoundedRect(r.adjusted(-1, -1, 1, 1), 3, 3)
+        grid = theme.color(theme.BORDER, 255)
         p.setPen(QPen(grid, 1.0))
         for k in (0.25, 0.5, 0.75):
             a, b = self.to_pixel(k, 0.0), self.to_pixel(k, 1.0)
-            p.drawLine(a, b)
+            p.drawLine(QPointF(round(a.x()) + 0.5, a.y()), QPointF(round(b.x()) + 0.5, b.y()))
             a, b = self.to_pixel(0.0, k), self.to_pixel(1.0, k)
-            p.drawLine(a, b)
-        # identity reference diagonal
-        diag = QColor(text)
-        diag.setAlpha(70)
-        pen = QPen(diag, 1.0, Qt.DashLine)
-        p.setPen(pen)
+            p.drawLine(QPointF(a.x(), round(a.y()) + 0.5), QPointF(b.x(), round(b.y()) + 0.5))
+        # identity reference diagonal (faint)
+        p.setPen(QPen(theme.color(theme.TEXT, 55), 1.0, Qt.DashLine))
         p.drawLine(self.to_pixel(0, 0), self.to_pixel(1, 1))
         # frame
-        frame = QColor(pal.mid().color())
-        p.setPen(QPen(frame, 1.0))
+        p.setPen(QPen(theme.color(theme.BORDER_HI), 1.0))
         p.setBrush(Qt.NoBrush)
-        p.drawRect(r)
+        p.drawRoundedRect(r.adjusted(-1, -1, 1, 1), 3, 3)
 
         ed = self._editor
         # faint curves of the other channels (only if non-identity)
@@ -197,21 +213,30 @@ class _CurvePlot(QWidget):
             if ch == ed._channel or _is_identity(ed._pts[ch]):
                 continue
             col = self._channel_colour(ch)
-            col.setAlpha(85)
-            p.setPen(QPen(col, 1.3))
+            col.setAlpha(95)
+            p.setPen(QPen(col, 1.4))
             p.drawPath(self._curve_path(ed._pts[ch]))
-        # selected channel
+        # selected channel: soft glow + thick curve
         col = self._channel_colour(ed._channel)
-        p.setPen(QPen(col, 2.0))
-        p.drawPath(self._curve_path(ed._pts[ed._channel]))
+        if not enabled:
+            col.setAlpha(120)
+        path = self._curve_path(ed._pts[ed._channel])
+        glow = QColor(col)
+        glow.setAlpha(50)
+        p.setPen(QPen(glow, 6.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPath(path)
+        p.setPen(QPen(col, 2.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.drawPath(path)
         for i, (x, y) in enumerate(ed._pts[ed._channel]):
             active = i in (self._hover, self._drag)
-            radius = POINT_RADIUS + (1.0 if active else 0.0)
-            p.setPen(QPen(text, 1.2))
-            fill = QColor(col)
-            fill = fill.lighter(130) if active else fill
-            p.setBrush(fill)
-            p.drawEllipse(self.to_pixel(x, y), radius, radius)
+            q = self.to_pixel(x, y)
+            if active:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(theme.color(theme.GOLD[0]), 1.8))
+                p.drawEllipse(q, POINT_RADIUS + 3.2, POINT_RADIUS + 3.2)
+            p.setPen(QPen(theme.color(theme.TEXT), 1.3))
+            p.setBrush(col)
+            p.drawEllipse(q, POINT_RADIUS, POINT_RADIUS)
         p.end()
 
     # -- mouse -----------------------------------------------------------------
@@ -298,64 +323,62 @@ class CurveEditor(QWidget):
     #: Emitted after any user (or programmatic add/move/remove/reset) edit.
     curves_changed = Signal()
 
-    _HINT = "Click to add a point; double-click or right-click a point to remove"
+    _IDLE = "IN \u2192 OUT"
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._pts: list[_Points] = [[tuple(p) for p in IDENTITY_CURVE] for _ in range(4)]
         self._channel = 0
 
-        # channel selector (compact segmented buttons)
-        self._group = QButtonGroup(self)
-        self._group.setExclusive(True)
-        self._tabs: list[QPushButton] = []
-        tab_row = QHBoxLayout()
-        tab_row.setContentsMargins(0, 0, 0, 0)
-        tab_row.setSpacing(0)
-        for i, name in enumerate(CHANNELS):
-            b = QPushButton(name, self)
-            b.setCheckable(True)
-            b.setFocusPolicy(Qt.NoFocus)
-            b.setStyleSheet(
-                "QPushButton { padding: 2px 6px; border: 1px solid palette(mid);"
-                " background: palette(button); }"
-                "QPushButton:checked { background: palette(highlight);"
-                " color: palette(highlighted-text); }"
-            )
-            self._group.addButton(b, i)
-            self._tabs.append(b)
-            tab_row.addWidget(b, 1)
+        # channel selector: pill group  RGB | R | G | B
+        tabs_box, self._tabs, self._group = make_segmented(self, CHANNELS)
         self._tabs[0].setChecked(True)
         self._group.idClicked.connect(self._on_tab)
 
         self.plot = _CurvePlot(self)
 
-        self._readout = QLabel(self._HINT, self)
-        self._readout.setWordWrap(True)
-        small = self._readout.font()
-        small.setPointSizeF(max(8.0, small.pointSizeF() * 0.85))
-        self._readout.setFont(small)
-        self._readout.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        # reserve two lines so swapping hint <-> readout never shifts the layout
-        self._readout.setMinimumHeight(2 * self._readout.fontMetrics().lineSpacing())
-        self._readout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        mono = theme.mono_font(9, bold=True)
+        self._readout = QLabel(self._IDLE, self)
+        self._readout.setFont(mono)
+        self._readout.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._readout.setFixedWidth(QFontMetrics(mono).horizontalAdvance("255 \u2192 255") + 4)
+        self._set_readout_style(False)
 
-        self.reset_channel_button = QPushButton("Reset channel", self)
-        self.reset_all_button = QPushButton("Reset all curves", self)
+        self.reset_channel_button = QPushButton("RESET CH", self)
+        self.reset_all_button = QPushButton("RESET ALL", self)
+        for b, tip in ((self.reset_channel_button, "Reset the selected channel's curve"),
+                       (self.reset_all_button, "Reset all four curves")):
+            b.setFixedHeight(18)
+            b.setStyleSheet(ghost_button_stylesheet())
+            b.setToolTip(tip)
+            b.setCursor(Qt.PointingHandCursor)
         self.reset_channel_button.clicked.connect(self.reset_channel)
         self.reset_all_button.clicked.connect(self.reset_all)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
+        top_row.addWidget(tabs_box)
+        top_row.addStretch(1)
+        top_row.addWidget(self._readout)
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(6)
         btn_row.addWidget(self.reset_channel_button)
         btn_row.addWidget(self.reset_all_button)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        layout.addLayout(tab_row)
-        layout.addWidget(self.plot)
-        layout.addWidget(self._readout)
+        layout.addLayout(top_row)
+        layout.addWidget(self.plot, 0, Qt.AlignHCenter)
         layout.addLayout(btn_row)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def set_compact(self, compact: bool) -> None:
+        """Shrink / restore the plot (rack on a narrow or short window)."""
+        self.plot.set_side(PLOT_SIZE_COMPACT if compact else PLOT_SIZE)
+        self.updateGeometry()
 
     # ------------------------------------------------------------------ state
 
@@ -449,10 +472,15 @@ class CurveEditor(QWidget):
 
     # ----------------------------------------------------------------- readout
 
+    def _set_readout_style(self, active: bool) -> None:
+        self._readout.setStyleSheet(
+            f"color: {theme.GOLD[0] if active else theme.TEXT_DIM}; background: transparent;"
+        )
+
     def _set_readout(self, point: Optional[tuple[float, float]]) -> None:
         if point is None:
-            self._readout.setText(self._HINT)
+            self._readout.setText(self._IDLE)
+            self._set_readout_style(False)
         else:
-            self._readout.setText(
-                f"In {round(point[0] * 255)} → Out {round(point[1] * 255)}"
-            )
+            self._readout.setText(f"{round(point[0] * 255)} \u2192 {round(point[1] * 255)}")
+            self._set_readout_style(True)

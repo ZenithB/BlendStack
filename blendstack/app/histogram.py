@@ -12,29 +12,49 @@ from __future__ import annotations
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import QPointF
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
-__all__ = ["HistogramWidget"]
+from . import theme
+
+__all__ = ["HistogramWidget", "contrast_pairs"]
 
 #: Draw order: R, G, B first, luma on top.
 _CHANNEL_COLORS = (
-    QColor(235, 90, 90),    # R
-    QColor(110, 210, 110),  # G
-    QColor(110, 140, 245),  # B
-    QColor(235, 235, 235),  # Rec.709 luma
+    theme.CHANNEL_R,
+    theme.CHANNEL_G,
+    theme.CHANNEL_B,
+    theme.CHANNEL_L,  # Rec.709 luma
 )
 
 
+def contrast_pairs() -> list[tuple[str, str, str]]:
+    """(name, foreground, background) pairs hard-wired in this module."""
+    return [
+        ("histogram caption on inset", theme.TEXT_DIM, theme.INSET),
+        ("histogram red on inset", theme.CHANNEL_R, theme.INSET),
+        ("histogram green on inset", theme.CHANNEL_G, theme.INSET),
+        ("histogram blue on inset", theme.CHANNEL_B, theme.INSET),
+        ("histogram luma on inset", theme.CHANNEL_L, theme.INSET),
+    ]
+
+
 class HistogramWidget(QWidget):
-    """Paints a (4, 256) bin-count array as four overlaid curves."""
+    """Paints a (4, 256) bin-count array as four overlaid curves (R, G, B
+    with soft translucent fills, luma as a bright line)."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._hist: Optional[np.ndarray] = None
-        self.setMinimumHeight(110)
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._caption_font = theme.mono_font(8, bold=True)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(200, 100)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(120, 56)
 
     def set_data(self, hist: Optional[np.ndarray]) -> None:
         """``hist`` is int (4, 256) — R, G, B, luma — or None to clear."""
@@ -51,17 +71,27 @@ class HistogramWidget(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(1, 1, -1, -1)
-        painter.fillRect(rect, QColor(24, 24, 26))
-        painter.setPen(QColor(70, 70, 74))
-        painter.drawRect(rect)
-        for i in (1, 2, 3):  # quarter gridlines
-            x = rect.left() + rect.width() * i / 4.0
-            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.setPen(QPen(theme.color(theme.BORDER), 1.0))
+        painter.setBrush(theme.color(theme.INSET))
+        painter.drawRoundedRect(rect, 4, 4)
+        inner = rect.adjusted(1, 1, -1, -1)
 
+        # faint grid: quarter verticals + a mid horizontal
+        painter.setPen(QPen(theme.color(theme.BORDER, 150), 1.0))
+        for i in (1, 2, 3):
+            x = round(inner.left() + inner.width() * i / 4.0) + 0.5
+            painter.drawLine(QPointF(x, inner.top() + 1), QPointF(x, inner.bottom() - 1))
+        y = round(inner.top() + inner.height() / 2.0) + 0.5
+        painter.drawLine(QPointF(inner.left() + 1, y), QPointF(inner.right() - 1, y))
+
+        painter.setFont(self._caption_font)
+        painter.setPen(theme.color(theme.TEXT_DIM))
+        caption_rect = inner.adjusted(6, 3, -6, -3)
         if self._hist is None:
-            painter.setPen(QColor(120, 120, 125))
-            painter.drawText(rect, Qt.AlignCenter, "Histogram")
+            painter.drawText(inner, Qt.AlignCenter, "NO DATA")
+            painter.drawText(caption_rect, Qt.AlignLeft | Qt.AlignTop, "HIST")
             painter.end()
             return
 
@@ -70,18 +100,32 @@ class HistogramWidget(QWidget):
         interior_peak = float(self._hist[:, 1:255].max())
         peak = interior_peak if interior_peak > 0 else float(max(self._hist.max(), 1))
 
-        width = rect.width()
-        height = rect.height() - 2
+        width = inner.width() - 2
+        base = inner.bottom() - 1
+        height = inner.height() - 20
         for channel in range(4):
             counts = self._hist[channel]
-            points = QPolygonF()
+            line = QPolygonF()
             for b in range(256):
-                x = rect.left() + width * b / 255.0
+                x = inner.left() + 1 + width * b / 255.0
                 frac = min(counts[b] / peak, 1.0)
-                y = rect.bottom() - 1 - frac * height
-                points.append(QPointF(x, y))
-            color = QColor(_CHANNEL_COLORS[channel])
-            color.setAlpha(230 if channel == 3 else 190)
-            painter.setPen(QPen(color, 1.2))
-            painter.drawPolyline(points)
+                line.append(QPointF(x, base - frac * height))
+            color = theme.color(_CHANNEL_COLORS[channel])
+            if channel < 3:
+                fill = QPolygonF(line)
+                fill.append(QPointF(inner.right() - 1, base))
+                fill.append(QPointF(inner.left() + 1, base))
+                fc = QColor(color)
+                fc.setAlpha(46)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(fc)
+                painter.drawPolygon(fill)
+            color.setAlpha(235 if channel == 3 else 200)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(color, 1.5 if channel == 3 else 1.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline(line)
+
+        painter.setFont(self._caption_font)
+        painter.setPen(theme.color(theme.TEXT_DIM))
+        painter.drawText(caption_rect, Qt.AlignLeft | Qt.AlignTop, "RGB \u2022 LUMA")
         painter.end()
